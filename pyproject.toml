@@ -23,11 +23,6 @@ classifiers = [
     "Topic :: Text Processing :: General",
 ]
 
-[project.urls]
-Homepage = "https://github.com/r-uben/gemini-ocr-cli"
-Repository = "https://github.com/r-uben/gemini-ocr-cli"
-Issues = "https://github.com/r-uben/gemini-ocr-cli/issues"
-
 dependencies = [
     "google-genai>=1.0.0",
     "click>=8.1.0",
@@ -38,6 +33,11 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "python-dotenv>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/r-uben/gemini-ocr-cli"
+Repository = "https://github.com/r-uben/gemini-ocr-cli"
+Issues = "https://github.com/r-uben/gemini-ocr-cli/issues"
 
 [project.optional-dependencies]
 dev = [
