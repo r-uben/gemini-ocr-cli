@@ -1,6 +1,6 @@
 [project]
 name = "gemini-ocr-cli"
-version = "0.2.0"
+version = "0.2.1"
 description = "CLI tool for OCR processing using Google Gemini's vision capabilities"
 authors = [
     {name = "Ruben Fernandez-Fuertes", email = "fernandezfuertesruben@gmail.com"}
