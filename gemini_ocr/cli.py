@@ -64,8 +64,8 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option(
     "--model",
     type=str,
-    default="gemini-2.0-flash-exp",
-    help="Gemini model to use (default: gemini-2.0-flash-exp)",
+    default="gemini-3.0-flash",
+    help="Gemini model to use (default: gemini-3.0-flash)",
 )
 @click.option(
     "--task",
@@ -77,12 +77,6 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     "--prompt",
     type=str,
     help="Custom prompt for OCR processing",
-)
-@click.option(
-    "--dpi",
-    type=int,
-    default=200,
-    help="PDF rendering DPI (default: 200)",
 )
 @click.option(
     "--include-images/--no-images",
@@ -118,7 +112,6 @@ def process(
     model: str,
     task: str,
     prompt: Optional[str],
-    dpi: int,
     include_images: bool,
     save_originals: bool,
     add_timestamp: bool,
@@ -171,7 +164,6 @@ def process(
 
         # Override with CLI options
         config.model = model
-        config.dpi = dpi
         config.include_images = include_images
         config.save_original_images = save_originals
         config.verbose = ctx.obj["verbose"]
@@ -214,7 +206,7 @@ def process(
 @click.option(
     "--model",
     type=str,
-    default="gemini-2.0-flash-exp",
+    default="gemini-2.0-flash",
     help="Gemini model to use",
 )
 @click.option(

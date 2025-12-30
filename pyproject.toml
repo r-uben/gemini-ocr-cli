@@ -1,6 +1,6 @@
 [project]
 name = "gemini-ocr-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI tool for OCR processing using Google Gemini's vision capabilities"
 authors = [
     {name = "Ruben Fernandez-Fuertes", email = "fernandezfuertesruben@gmail.com"}
@@ -76,3 +76,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+markers = [
+    "unit: marks tests as unit tests (fast, no API)",
+    "integration: marks tests requiring GEMINI_API_KEY",
+]

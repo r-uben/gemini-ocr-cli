@@ -47,7 +47,7 @@ class Config(BaseSettings):
 
     # Model Configuration
     model: str = Field(
-        default="gemini-2.0-flash-exp",
+        default="gemini-3.0-flash",
         description="Gemini model to use for OCR",
     )
 
@@ -104,7 +104,3 @@ class Config(BaseSettings):
                 f"File size ({file_size_mb:.2f} MB) exceeds maximum "
                 f"allowed size ({self.max_file_size_mb} MB)"
             )
-
-
-# Default settings instance
-settings = Config()

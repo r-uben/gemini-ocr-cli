@@ -1,10 +1,8 @@
 """Utility functions for Gemini OCR CLI."""
 
-import base64
 import json
 import logging
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -97,33 +95,6 @@ def determine_output_path(
 
     base_output.mkdir(parents=True, exist_ok=True)
     return base_output
-
-
-def image_to_base64(image_path: Path) -> str:
-    """Convert image file to base64 string."""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def pil_image_to_base64(image: Image.Image, format: str = "PNG") -> str:
-    """Convert PIL Image to base64 string."""
-    import io
-
-    buffer = io.BytesIO()
-    image.save(buffer, format=format)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
-def save_base64_image(base64_data: str, output_path: Path) -> None:
-    """Save base64 encoded image to file."""
-    # Handle data URI format
-    if "," in base64_data:
-        base64_data = base64_data.split(",", 1)[1]
-
-    image_data = base64.b64decode(base64_data)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        f.write(image_data)
 
 
 def pdf_to_images(

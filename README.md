@@ -4,12 +4,14 @@ Command-line tool for OCR processing using Google Gemini's vision capabilities. 
 
 ## Features
 
+- **Native PDF upload**: Direct PDF processing via Gemini Files API (fast, single API call)
 - **Multi-format support**: PDF and images (JPG, PNG, WEBP, GIF, BMP, TIFF)
 - **High-quality OCR**: Leverages Gemini's advanced vision models
 - **Structure preservation**: Maintains headings, tables, lists, equations
 - **Figure analysis**: Generate detailed descriptions of charts and diagrams
 - **Batch processing**: Process entire directories with progress tracking
 - **Incremental processing**: Skip already-processed files
+- **Automatic retry**: Exponential backoff for API rate limits
 - **Markdown output**: Clean, structured output format
 
 ## Installation
@@ -95,10 +97,9 @@ Usage: gemini-ocr process [OPTIONS] INPUT_PATH
 Options:
   -o, --output-dir PATH           Output directory for results
   --api-key TEXT                  Gemini API key
-  --model TEXT                    Model to use (default: gemini-2.0-flash-exp)
+  --model TEXT                    Model to use (default: gemini-3.0-flash)
   --task [convert|extract|table]  OCR task type (default: convert)
   --prompt TEXT                   Custom prompt for OCR
-  --dpi INTEGER                   PDF rendering DPI (default: 200)
   --include-images/--no-images    Extract embedded images (default: True)
   --save-originals/--no-save-originals
                                   Save original input images (default: True)
@@ -129,7 +130,7 @@ Show configuration and system information.
 
 Results are saved as Markdown files with:
 - File metadata (original path, processing time)
-- Page-by-page extracted text
+- Extracted text (full document)
 - Embedded image references (if enabled)
 - `metadata.json` tracking all processed files
 
@@ -137,7 +138,7 @@ Results are saved as Markdown files with:
 
 | Model | Speed | Quality | Cost | Recommended For |
 |-------|-------|---------|------|-----------------|
-| `gemini-2.0-flash-exp` | Fast | Good | Low | Default, most documents |
+| `gemini-3.0-flash` | Fast | Good | Low | Default, most documents |
 | `gemini-1.5-flash` | Fast | Good | Low | Simple documents |
 | `gemini-1.5-pro` | Slower | Best | Higher | Complex layouts, equations |
 
@@ -146,8 +147,8 @@ Results are saved as Markdown files with:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GEMINI_API_KEY` | Google Gemini API key | Required |
-| `GEMINI_MODEL` | Default model | `gemini-2.0-flash-exp` |
-| `GEMINI_DPI` | PDF rendering DPI | `200` |
+| `GOOGLE_API_KEY` | Fallback API key | - |
+| `GEMINI_MODEL` | Default model | `gemini-3.0-flash` |
 
 ## License
 

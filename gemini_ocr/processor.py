@@ -1,4 +1,4 @@
-"""Core OCR processing module using Google Gemini."""
+"""Core OCR processing module using Google Gemini with native PDF support."""
 
 import io
 import logging
@@ -12,15 +12,10 @@ from google import genai
 from google.genai import types
 from PIL import Image
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from gemini_ocr.config import Config
+from gemini_ocr.retry import retry, is_retryable_error
 from gemini_ocr.utils import (
     determine_output_path,
     extract_pdf_images,
@@ -29,7 +24,6 @@ from gemini_ocr.utils import (
     is_image_file,
     is_pdf_file,
     load_metadata,
-    pdf_to_images,
     sanitize_filename,
     save_metadata,
 )
@@ -40,7 +34,7 @@ console = Console()
 
 # OCR prompts for different tasks
 OCR_PROMPTS = {
-    "convert": """Extract all text from this document image and convert it to clean markdown format.
+    "convert": """Extract all text from this document and convert it to clean markdown format.
 
 Rules:
 - Preserve the document structure (headings, paragraphs, lists, tables)
@@ -49,7 +43,7 @@ Rules:
 - Include figure/image captions if present
 - Do not describe images, just note their presence as [Figure X] or [Image]
 - Output ONLY the extracted text in markdown, no commentary""",
-    "extract": """Extract all visible text from this image exactly as it appears.
+    "extract": """Extract all visible text from this document exactly as it appears.
 Output only the extracted text, preserving line breaks and spacing.""",
     "describe_figure": """Analyze this figure/chart/diagram in detail:
 1. What type of visualization is this? (bar chart, line graph, flowchart, etc.)
@@ -58,20 +52,9 @@ Output only the extracted text, preserving line breaks and spacing.""",
 4. What are the main findings or takeaways?
 
 Provide a structured description.""",
-    "table": """Extract the table from this image and convert it to markdown format.
-Preserve all data, headers, and structure. Output only the markdown table.""",
+    "table": """Extract all tables from this document and convert them to markdown format.
+Preserve all data, headers, and structure. Output only the markdown tables.""",
 }
-
-
-@dataclass
-class PageResult:
-    """Result from processing a single page."""
-
-    page_number: int
-    text: str
-    success: bool
-    error: Optional[str] = None
-    processing_time: float = 0.0
 
 
 @dataclass
@@ -79,36 +62,29 @@ class OCRResult:
     """Result from processing a document."""
 
     file_path: Path
-    pages: List[PageResult]
-    total_pages: int
-    successful_pages: int
-    failed_pages: int
-    processing_time: float
+    text: str
+    success: bool
+    error: Optional[str] = None
+    processing_time: float = 0.0
+    token_count: Optional[int] = None
     extracted_images: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
-    def success(self) -> bool:
-        return self.successful_pages > 0
-
-    @property
-    def text(self) -> str:
-        """Get combined text from all pages."""
-        parts = []
-        for page in self.pages:
-            if page.success and page.text:
-                parts.append(f"<!-- Page {page.page_number} -->\n{page.text}")
-        return "\n\n".join(parts)
+    def total_pages(self) -> int:
+        """Estimate page count (for compatibility)."""
+        # Rough estimate: ~3000 chars per page
+        return max(1, len(self.text) // 3000) if self.text else 0
 
 
 class OCRProcessor:
-    """OCR processor using Google Gemini API."""
+    """OCR processor using Google Gemini API with native PDF support."""
 
     def __init__(self, config: Config):
         """Initialize the OCR processor."""
         self.config = config
         config.validate_api_key()
 
-        # Initialize Gemini client with new API
+        # Initialize Gemini client
         self.client = genai.Client(api_key=config.api_key)
         self.model_name = config.model
 
@@ -117,10 +93,36 @@ class OCRProcessor:
 
         logger.info(f"Initialized OCRProcessor with model: {config.model}")
 
+    def _upload_file(self, file_path: Path) -> Any:
+        """Upload file to Gemini Files API.
+
+        Args:
+            file_path: Path to the file to upload
+
+        Returns:
+            Uploaded file object from Gemini API
+        """
+        if self.config.verbose:
+            console.print(f"[dim]Uploading {file_path.name}...[/dim]")
+
+        uploaded = self.client.files.upload(file=str(file_path))
+
+        # Wait for file to be processed
+        while uploaded.state == "PROCESSING":
+            time.sleep(0.5)
+            uploaded = self.client.files.get(name=uploaded.name)
+
+        if uploaded.state == "FAILED":
+            raise RuntimeError(f"File upload failed: {uploaded.name}")
+
+        if self.config.verbose:
+            console.print(f"[dim]Upload complete: {uploaded.name}[/dim]")
+
+        return uploaded
+
     def _pil_to_part(self, image: Image.Image) -> types.Part:
         """Convert PIL Image to Gemini Part."""
         buffer = io.BytesIO()
-        # Convert to RGB if necessary
         if image.mode != "RGB":
             image = image.convert("RGB")
         image.save(buffer, format="JPEG", quality=95)
@@ -131,31 +133,33 @@ class OCRProcessor:
             mime_type="image/jpeg",
         )
 
-    def _process_image_with_gemini(
+    @retry(max_attempts=3, backoff_factor=2.0, initial_delay=1.0)
+    def _generate_content(
         self,
-        image: Image.Image,
+        contents: List[Any],
         prompt: str,
     ) -> str:
-        """Process a single image with Gemini."""
-        try:
-            image_part = self._pil_to_part(image)
+        """Generate content with retry logic.
 
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=[prompt, image_part],
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=8192,
-                ),
-            )
+        Args:
+            contents: List of content parts (files, images, text)
+            prompt: The prompt to send
 
-            if response.text:
-                return response.text.strip()
-            return ""
+        Returns:
+            Generated text response
+        """
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[prompt, *contents],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=8192,
+            ),
+        )
 
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            raise
+        if response.text:
+            return response.text.strip()
+        return ""
 
     def process_image(
         self,
@@ -163,7 +167,16 @@ class OCRProcessor:
         task: str = "convert",
         custom_prompt: Optional[str] = None,
     ) -> OCRResult:
-        """Process a single image file."""
+        """Process a single image file.
+
+        Args:
+            image_path: Path to the image file
+            task: OCR task type
+            custom_prompt: Optional custom prompt
+
+        Returns:
+            OCRResult with extracted text
+        """
         start_time = time.time()
 
         try:
@@ -174,23 +187,15 @@ class OCRProcessor:
                 image = image.convert("RGB")
 
             prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-            text = self._process_image_with_gemini(image, prompt)
+            image_part = self._pil_to_part(image)
 
+            text = self._generate_content([image_part], prompt)
             processing_time = time.time() - start_time
 
             return OCRResult(
                 file_path=image_path,
-                pages=[
-                    PageResult(
-                        page_number=1,
-                        text=text,
-                        success=True,
-                        processing_time=processing_time,
-                    )
-                ],
-                total_pages=1,
-                successful_pages=1,
-                failed_pages=0,
+                text=text,
+                success=True,
                 processing_time=processing_time,
             )
 
@@ -201,18 +206,9 @@ class OCRProcessor:
 
             return OCRResult(
                 file_path=image_path,
-                pages=[
-                    PageResult(
-                        page_number=1,
-                        text="",
-                        success=False,
-                        error=error_msg,
-                        processing_time=processing_time,
-                    )
-                ],
-                total_pages=1,
-                successful_pages=0,
-                failed_pages=1,
+                text="",
+                success=False,
+                error=error_msg,
                 processing_time=processing_time,
             )
 
@@ -221,130 +217,92 @@ class OCRProcessor:
         pdf_path: Path,
         task: str = "convert",
         custom_prompt: Optional[str] = None,
-        pages: Optional[List[int]] = None,
         show_progress: bool = True,
     ) -> OCRResult:
-        """Process a PDF file page by page."""
+        """Process a PDF file using native Gemini PDF support.
+
+        This method uploads the entire PDF to Gemini's Files API and processes
+        it in a single API call, which is faster and more accurate than
+        converting to images page-by-page.
+
+        Args:
+            pdf_path: Path to the PDF file
+            task: OCR task type
+            custom_prompt: Optional custom prompt
+            show_progress: Whether to show progress indicator
+
+        Returns:
+            OCRResult with extracted text
+        """
         start_time = time.time()
         self.config.validate_file_size(pdf_path)
 
-        # Convert PDF pages to images
-        if self.config.verbose:
-            console.print(f"[dim]Converting PDF to images at {self.config.dpi} DPI...[/dim]")
+        try:
+            # Upload PDF to Gemini Files API
+            if show_progress:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=console,
+                    transient=True,
+                ) as progress:
+                    progress.add_task("Uploading PDF...", total=None)
+                    uploaded_file = self._upload_file(pdf_path)
+                    progress.update(progress.task_ids[0], description="Processing...")
 
-        page_images = pdf_to_images(pdf_path, dpi=self.config.dpi, pages=pages)
-        total_pages = len(page_images)
+                    prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
+                    text = self._generate_content([uploaded_file], prompt)
+            else:
+                uploaded_file = self._upload_file(pdf_path)
+                prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
+                text = self._generate_content([uploaded_file], prompt)
 
-        if total_pages == 0:
+            # Extract embedded images if configured
+            extracted_images = []
+            if self.config.include_images:
+                try:
+                    extracted_images = extract_pdf_images(pdf_path)
+                except Exception as e:
+                    logger.warning(f"Failed to extract embedded images: {e}")
+
+            processing_time = time.time() - start_time
+
             return OCRResult(
                 file_path=pdf_path,
-                pages=[],
-                total_pages=0,
-                successful_pages=0,
-                failed_pages=0,
-                processing_time=time.time() - start_time,
-            )
-
-        prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-        page_results: List[PageResult] = []
-        successful = 0
-        failed = 0
-
-        # Extract embedded images if configured
-        extracted_images = []
-        if self.config.include_images:
-            try:
-                extracted_images = extract_pdf_images(pdf_path)
-            except Exception as e:
-                logger.warning(f"Failed to extract embedded images: {e}")
-
-        # Process each page
-        if show_progress and total_pages > 1:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                task_id = progress.add_task(f"Processing {total_pages} pages...", total=total_pages)
-
-                for idx, image in enumerate(page_images):
-                    page_num = (pages[idx] if pages else idx) + 1
-                    progress.update(task_id, description=f"Page {page_num}/{total_pages}...")
-
-                    page_result = self._process_single_page(image, page_num, prompt)
-                    page_results.append(page_result)
-
-                    if page_result.success:
-                        successful += 1
-                    else:
-                        failed += 1
-
-                    progress.update(task_id, advance=1)
-        else:
-            for idx, image in enumerate(page_images):
-                page_num = (pages[idx] if pages else idx) + 1
-
-                if self.config.verbose:
-                    console.print(f"[dim]Processing page {page_num}/{total_pages}...[/dim]")
-
-                page_result = self._process_single_page(image, page_num, prompt)
-                page_results.append(page_result)
-
-                if page_result.success:
-                    successful += 1
-                else:
-                    failed += 1
-
-        processing_time = time.time() - start_time
-
-        return OCRResult(
-            file_path=pdf_path,
-            pages=page_results,
-            total_pages=total_pages,
-            successful_pages=successful,
-            failed_pages=failed,
-            processing_time=processing_time,
-            extracted_images=extracted_images,
-        )
-
-    def _process_single_page(
-        self,
-        image: Image.Image,
-        page_number: int,
-        prompt: str,
-    ) -> PageResult:
-        """Process a single page image."""
-        page_start = time.time()
-
-        try:
-            text = self._process_image_with_gemini(image, prompt)
-            return PageResult(
-                page_number=page_number,
                 text=text,
                 success=True,
-                processing_time=time.time() - page_start,
+                processing_time=processing_time,
+                extracted_images=extracted_images,
             )
+
         except Exception as e:
+            processing_time = time.time() - start_time
             error_msg = str(e)
-            logger.error(f"Error processing page {page_number}: {error_msg}")
-            return PageResult(
-                page_number=page_number,
+            logger.error(f"Error processing {pdf_path}: {error_msg}")
+
+            return OCRResult(
+                file_path=pdf_path,
                 text="",
                 success=False,
                 error=error_msg,
-                processing_time=time.time() - page_start,
+                processing_time=processing_time,
             )
 
     def describe_figure(self, image_path: Path) -> str:
-        """Generate a detailed description of a figure/chart."""
+        """Generate a detailed description of a figure/chart.
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            Detailed description of the figure
+        """
         image = Image.open(image_path)
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        return self._process_image_with_gemini(image, OCR_PROMPTS["describe_figure"])
+        image_part = self._pil_to_part(image)
+        return self._generate_content([image_part], OCR_PROMPTS["describe_figure"])
 
     def process_file(
         self,
@@ -353,7 +311,17 @@ class OCRProcessor:
         custom_prompt: Optional[str] = None,
         show_progress: bool = True,
     ) -> OCRResult:
-        """Process a single file (image or PDF)."""
+        """Process a single file (image or PDF).
+
+        Args:
+            file_path: Path to the file
+            task: OCR task type
+            custom_prompt: Optional custom prompt
+            show_progress: Whether to show progress
+
+        Returns:
+            OCRResult with extracted text
+        """
         if is_pdf_file(file_path):
             return self.process_pdf(
                 file_path,
@@ -375,15 +343,20 @@ class OCRProcessor:
         result: OCRResult,
         output_dir: Path,
     ) -> Path:
-        """Save OCR results to files."""
+        """Save OCR results to files.
+
+        Args:
+            result: OCRResult to save
+            output_dir: Directory to save results
+
+        Returns:
+            Path to the saved markdown file
+        """
         base_name = sanitize_filename(result.file_path.stem)
         markdown_path = output_dir / f"{base_name}.md"
 
         # Save original image if configured
-        if (
-            self.config.save_original_images
-            and is_image_file(result.file_path)
-        ):
+        if self.config.save_original_images and is_image_file(result.file_path):
             originals_dir = output_dir / "original_images"
             originals_dir.mkdir(parents=True, exist_ok=True)
             original_output = originals_dir / f"{base_name}{result.file_path.suffix}"
@@ -395,20 +368,15 @@ class OCRProcessor:
         content.append(f"**Original File:** {result.file_path.name}\n")
         content.append(f"**Full Path:** `{result.file_path}`\n")
         content.append(f"**Processed:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        content.append(f"**Pages:** {result.successful_pages}/{result.total_pages} successful\n")
         content.append(f"**Processing Time:** {result.processing_time:.2f}s\n")
         content.append("\n---\n\n")
 
-        # Add page content
-        for page in result.pages:
-            if result.total_pages > 1:
-                content.append(f"## Page {page.page_number}\n\n")
-
-            if page.success:
-                content.append(page.text)
-                content.append("\n\n")
-            else:
-                content.append(f"*[OCR Failed: {page.error}]*\n\n")
+        # Add extracted content
+        if result.success:
+            content.append(result.text)
+            content.append("\n\n")
+        else:
+            content.append(f"*[OCR Failed: {result.error}]*\n\n")
 
         # Save extracted images if any
         if result.extracted_images and self.config.include_images:
@@ -447,7 +415,16 @@ class OCRProcessor:
         add_timestamp: bool = False,
         reprocess: bool = False,
     ) -> None:
-        """Process input path (file or directory)."""
+        """Process input path (file or directory).
+
+        Args:
+            input_path: Path to file or directory
+            output_path: Optional output directory
+            task: OCR task type
+            custom_prompt: Optional custom prompt
+            add_timestamp: Add timestamp to output folder
+            reprocess: Reprocess already-processed files
+        """
         if input_path.is_file():
             self._process_single_file(
                 input_path,
@@ -503,15 +480,14 @@ class OCRProcessor:
                     "size": file_path.stat().st_size,
                     "output": str(output_file),
                     "pages": result.total_pages,
-                    "successful_pages": result.successful_pages,
                 }
             )
             save_metadata(output_dir, self.processed_files, result.processing_time, self.errors)
-            console.print(f"\n[green]Success:[/green] {result.successful_pages}/{result.total_pages} pages")
+            console.print(f"\n[green]Success[/green]")
             console.print(f"[dim]Time: {result.processing_time:.2f}s[/dim]")
         else:
-            self.errors.append({"file": str(file_path), "error": "All pages failed"})
-            console.print(f"\n[red]Failed to process file[/red]")
+            self.errors.append({"file": str(file_path), "error": result.error})
+            console.print(f"\n[red]Failed to process file: {result.error}[/red]")
 
     def _process_directory(
         self,
@@ -567,13 +543,12 @@ class OCRProcessor:
                         "size": file_path.stat().st_size,
                         "output": str(output_file),
                         "pages": result.total_pages,
-                        "successful_pages": result.successful_pages,
                     }
                 )
                 success_count += 1
-                console.print(f"  [green]OK[/green] ({result.successful_pages}/{result.total_pages} pages)\n")
+                console.print(f"  [green]OK[/green] ({result.processing_time:.1f}s)\n")
             else:
-                self.errors.append({"file": str(file_path), "error": "Processing failed"})
+                self.errors.append({"file": str(file_path), "error": result.error})
                 console.print(f"  [red]FAILED[/red]\n")
 
         total_time = time.time() - start_time
