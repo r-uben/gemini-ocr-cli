@@ -1,155 +1,138 @@
 # Gemini OCR CLI
 
-Command-line tool for OCR processing using Google Gemini's vision capabilities. Extract text, tables, equations, and figures from PDFs and images with high accuracy.
+[![CI](https://github.com/r-uben/gemini-ocr-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/r-uben/gemini-ocr-cli/actions/workflows/ci.yml)
+[![PyPI version](https://badge.fury.io/py/gemini-ocr-cli.svg)](https://badge.fury.io/py/gemini-ocr-cli)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Features
-
-- **Native PDF upload**: Direct PDF processing via Gemini Files API (fast, single API call)
-- **Multi-format support**: PDF and images (JPG, PNG, WEBP, GIF, BMP, TIFF)
-- **High-quality OCR**: Leverages Gemini's advanced vision models
-- **Structure preservation**: Maintains headings, tables, lists, equations
-- **Figure analysis**: Generate detailed descriptions of charts and diagrams
-- **Batch processing**: Process entire directories with progress tracking
-- **Incremental processing**: Skip already-processed files
-- **Automatic retry**: Exponential backoff for API rate limits
-- **Markdown output**: Clean, structured output format
+A command-line tool for OCR processing using Google Gemini's vision capabilities. Process PDFs and images to extract text, tables, equations, and figures.
 
 ## Installation
 
-### From PyPI (recommended)
+Requires Python 3.11+ and a [Google Gemini API key](https://aistudio.google.com/apikey).
 
 ```bash
 pip install gemini-ocr-cli
 ```
 
-### Using pipx
-
-```bash
-pipx install gemini-ocr-cli
-```
-
-### From source
+Or from source:
 
 ```bash
 git clone https://github.com/r-uben/gemini-ocr-cli.git
 cd gemini-ocr-cli
-uv pip install -e .
+uv sync
 ```
 
-## Quick Start
+## Quick start
 
-### API Key Resolution
+```bash
+# Set your API key
+export GEMINI_API_KEY="your_key_here"
 
-The CLI automatically picks up your API key from environment variables (no configuration needed if already set):
+# Process a single file
+gemini-ocr document.pdf
+
+# Process a directory
+gemini-ocr ./documents -o ./results
+
+# Preview what would be processed (no API calls)
+gemini-ocr ./documents --dry-run
+
+# Process 4 files concurrently
+gemini-ocr ./documents -w 4
+```
+
+## Options
+
+```
+Usage: gemini-ocr [OPTIONS] INPUT_PATH
+
+Options:
+  -o, --output-dir PATH           Output directory (default: <input_dir>/gemini_ocr_output/)
+  --api-key TEXT                  Gemini API key (or set GEMINI_API_KEY env var)
+  --model TEXT                    Model to use (default: gemini-3.1-flash-lite-preview)
+  --task [convert|extract|table|describe_figure]
+                                  OCR task type (default: convert)
+  --prompt TEXT                   Custom prompt for OCR processing
+
+  --include-images/--no-images    Extract embedded images (default: True)
+  --save-originals/--no-save-originals  Copy original images to output (default: True)
+
+  -w, --workers N                 Concurrent workers for batch processing (default: 1)
+  --reprocess                     Reprocess already-processed files
+  --dry-run                       List files without calling the API
+  -q, --quiet                     Suppress all output except errors
+  -v, --verbose                   Enable verbose/debug output
+  --info                          Show configuration and system info
+  --env-file PATH                 Path to .env file
+  --version                       Show version
+  --help                          Show this message
+```
+
+## Output structure
+
+```
+gemini_ocr_output/
+├── document_name/
+│   ├── document_name.md        # OCR markdown (clean text only)
+│   └── figures/                # extracted embedded images
+│       ├── page1_img1.png
+│       └── page2_img1.png
+├── another_document/
+│   └── ...
+└── metadata.json               # processing stats, checksums, file list
+```
+
+## API key resolution
 
 **Priority order:**
-1. `--api-key` CLI argument (highest priority)
+1. `--api-key` CLI argument
 2. `GEMINI_API_KEY` environment variable
 3. `GOOGLE_API_KEY` environment variable (fallback)
 4. `.env` file in current directory
 
-```bash
-# Option 1: Set environment variable (recommended)
-export GEMINI_API_KEY="your-api-key"
+## Configuration
 
-# Option 2: Use existing GOOGLE_API_KEY (auto-detected)
-export GOOGLE_API_KEY="your-api-key"
+All CLI options can also be set via environment variables or a `.env` file:
 
-# Option 3: Create a .env file
-echo "GEMINI_API_KEY=your-api-key" > .env
+| CLI flag | Environment variable | Default |
+|----------|---------------------|---------|
+| `--api-key` | `GEMINI_API_KEY` | (required) |
+| `--model` | `GEMINI_MODEL` | `gemini-3.1-flash-lite-preview` |
+| `--include-images` | `GEMINI_INCLUDE_IMAGES` | `true` |
+| `--save-originals` | `GEMINI_SAVE_ORIGINAL_IMAGES` | `true` |
+| `--workers` | `GEMINI_MAX_WORKERS` | `1` |
+| `--verbose` | `GEMINI_VERBOSE` | `false` |
+| | `GEMINI_MAX_FILE_SIZE_MB` | `50` |
+| | `GEMINI_MAX_RETRIES` | `3` |
+| | `GEMINI_RETRY_BASE_DELAY` | `1.0` |
 
-# Option 4: Pass directly (not recommended for security)
-gemini-ocr paper.pdf --api-key "your-api-key"
-```
+CLI flags override environment variables when explicitly passed.
 
-### Process documents
-
-```bash
-# Single file
-gemini-ocr paper.pdf
-
-# Directory
-gemini-ocr ./documents/ -o ./results/
-
-# With custom model
-gemini-ocr paper.pdf --model gemini-1.5-pro
-```
-
-### Describe figures
+## Development
 
 ```bash
-# Analyze a chart/diagram
-gemini-ocr describe chart.png
+# Install dev dependencies
+uv sync --extra dev
 
-# Save to file
-gemini-ocr describe figure.jpg -o description.md
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check .
+
+# Format
+uv run ruff format .
+
+# Type check
+uv run mypy gemini_ocr/ --ignore-missing-imports
 ```
 
-## CLI Reference
+## Limitations
 
-### `gemini-ocr process`
-
-Process documents and images with OCR.
-
-```
-Usage: gemini-ocr process [OPTIONS] INPUT_PATH
-
-Options:
-  -o, --output-dir PATH           Output directory for results
-  --api-key TEXT                  Gemini API key
-  --model TEXT                    Model to use (default: gemini-3.0-flash)
-  --task [convert|extract|table]  OCR task type (default: convert)
-  --prompt TEXT                   Custom prompt for OCR
-  --include-images/--no-images    Extract embedded images (default: True)
-  --save-originals/--no-save-originals
-                                  Save original input images (default: True)
-  --add-timestamp/--no-timestamp  Add timestamp to output folder
-  --reprocess                     Reprocess existing files
-  --env-file PATH                 Path to .env file
-  -v, --verbose                   Enable verbose output
-```
-
-### `gemini-ocr describe`
-
-Generate detailed descriptions of figures, charts, and diagrams.
-
-```
-Usage: gemini-ocr describe [OPTIONS] IMAGE_PATH
-
-Options:
-  --api-key TEXT    Gemini API key
-  --model TEXT      Model to use
-  -o, --output PATH Output file (default: stdout)
-```
-
-### `gemini-ocr info`
-
-Show configuration and system information.
-
-## Output Format
-
-Results are saved as Markdown files with:
-- File metadata (original path, processing time)
-- Extracted text (full document)
-- Embedded image references (if enabled)
-- `metadata.json` tracking all processed files
-
-## Models
-
-| Model | Speed | Quality | Cost | Recommended For |
-|-------|-------|---------|------|-----------------|
-| `gemini-3.0-flash` | Fast | Good | Low | Default, most documents |
-| `gemini-1.5-flash` | Fast | Good | Low | Simple documents |
-| `gemini-1.5-pro` | Slower | Best | Higher | Complex layouts, equations |
-
-## Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `GEMINI_API_KEY` | Google Gemini API key | Required |
-| `GOOGLE_API_KEY` | Fallback API key | - |
-| `GEMINI_MODEL` | Default model | `gemini-3.0-flash` |
+- Maximum file size: 50 MB (configurable via `GEMINI_MAX_FILE_SIZE_MB`)
+- Supported formats: PDF, JPG, JPEG, PNG, WEBP, GIF, BMP, TIFF
 
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.

@@ -3,19 +3,21 @@
 import io
 import logging
 import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from google import genai
 from google.genai import types
 from PIL import Image
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
 from gemini_ocr.config import Config
-from gemini_ocr.retry import retry, is_retryable_error
+from gemini_ocr.metadata import MetadataManager
 from gemini_ocr.utils import (
     determine_output_path,
     extract_pdf_images,
@@ -23,14 +25,13 @@ from gemini_ocr.utils import (
     get_supported_files,
     is_image_file,
     is_pdf_file,
-    load_metadata,
     sanitize_filename,
-    save_metadata,
 )
 
 logger = logging.getLogger(__name__)
-console = Console()
 
+# Shared console instance — CLI sets .quiet on this directly
+console = Console()
 
 # OCR prompts for different tasks
 OCR_PROMPTS = {
@@ -64,16 +65,9 @@ class OCRResult:
     file_path: Path
     text: str
     success: bool
-    error: Optional[str] = None
+    error: str | None = None
     processing_time: float = 0.0
-    token_count: Optional[int] = None
-    extracted_images: List[Dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def total_pages(self) -> int:
-        """Estimate page count (for compatibility)."""
-        # Rough estimate: ~3000 chars per page
-        return max(1, len(self.text) // 3000) if self.text else 0
+    extracted_images: list[dict[str, Any]] = field(default_factory=list)
 
 
 class OCRProcessor:
@@ -83,31 +77,69 @@ class OCRProcessor:
         """Initialize the OCR processor."""
         self.config = config
         config.validate_api_key()
-
-        # Initialize Gemini client
         self.client = genai.Client(api_key=config.api_key)
         self.model_name = config.model
-
-        self.errors: List[Dict] = []
-        self.processed_files: List[Dict] = []
-
+        self._lock = threading.Lock()
         logger.info(f"Initialized OCRProcessor with model: {config.model}")
 
+    @staticmethod
+    def _is_retryable(error: Exception) -> bool:
+        """Check if an error is transient and worth retrying."""
+        # Google GenAI SDK typed errors
+        for exc_name in ("ResourceExhausted", "InternalServerError", "ServiceUnavailable"):
+            if type(error).__name__ == exc_name:
+                return True
+        # httpx-level HTTP status errors
+        if hasattr(error, "response"):
+            status = getattr(error.response, "status_code", 0)
+            if status in (429, 500, 502, 503, 504):
+                return True
+        # Network-level transient errors
+        if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+            return True
+        # Check error message for rate-limit indicators
+        error_str = str(error).lower()
+        return "429" in error_str or "rate limit" in error_str or "quota" in error_str
+
+    def _call_with_retry(self, contents: list[Any], prompt: str) -> str:
+        """Call generate_content with exponential backoff on transient errors."""
+        max_attempts = self.config.max_retries + 1
+        base_delay = self.config.retry_base_delay
+
+        for attempt in range(max_attempts):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[prompt, *contents],
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                    ),
+                )
+                if response.text:
+                    return response.text.strip()
+                return ""
+            except Exception as e:
+                is_last = attempt == max_attempts - 1
+                if is_last or not self._is_retryable(e):
+                    raise
+                delay = base_delay * (2**attempt)
+                logger.warning(
+                    "Retryable error (attempt %d/%d): %s. Retrying in %.1fs...",
+                    attempt + 1,
+                    max_attempts,
+                    e,
+                    delay,
+                )
+                time.sleep(delay)
+        raise RuntimeError("Retry loop exited unexpectedly")
+
     def _upload_file(self, file_path: Path) -> Any:
-        """Upload file to Gemini Files API.
-
-        Args:
-            file_path: Path to the file to upload
-
-        Returns:
-            Uploaded file object from Gemini API
-        """
+        """Upload file to Gemini Files API."""
         if self.config.verbose:
             console.print(f"[dim]Uploading {file_path.name}...[/dim]")
 
         uploaded = self.client.files.upload(file=str(file_path))
 
-        # Wait for file to be processed
         while uploaded.state == "PROCESSING":
             time.sleep(0.5)
             uploaded = self.client.files.get(name=uploaded.name)
@@ -127,119 +159,53 @@ class OCRProcessor:
             image = image.convert("RGB")
         image.save(buffer, format="JPEG", quality=95)
         buffer.seek(0)
-
-        return types.Part.from_bytes(
-            data=buffer.getvalue(),
-            mime_type="image/jpeg",
-        )
-
-    @retry(max_attempts=3, backoff_factor=2.0, initial_delay=1.0)
-    def _generate_content(
-        self,
-        contents: List[Any],
-        prompt: str,
-    ) -> str:
-        """Generate content with retry logic.
-
-        Args:
-            contents: List of content parts (files, images, text)
-            prompt: The prompt to send
-
-        Returns:
-            Generated text response
-        """
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=[prompt, *contents],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=8192,
-            ),
-        )
-
-        if response.text:
-            return response.text.strip()
-        return ""
+        return types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/jpeg")
 
     def process_image(
         self,
         image_path: Path,
         task: str = "convert",
-        custom_prompt: Optional[str] = None,
+        custom_prompt: str | None = None,
     ) -> OCRResult:
-        """Process a single image file.
-
-        Args:
-            image_path: Path to the image file
-            task: OCR task type
-            custom_prompt: Optional custom prompt
-
-        Returns:
-            OCRResult with extracted text
-        """
+        """Process a single image file."""
         start_time = time.time()
-
         try:
             self.config.validate_file_size(image_path)
             image = Image.open(image_path)
-
             if image.mode != "RGB":
                 image = image.convert("RGB")
-
             prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
             image_part = self._pil_to_part(image)
-
-            text = self._generate_content([image_part], prompt)
-            processing_time = time.time() - start_time
-
+            text = self._call_with_retry([image_part], prompt)
             return OCRResult(
                 file_path=image_path,
                 text=text,
                 success=True,
-                processing_time=processing_time,
+                processing_time=time.time() - start_time,
             )
-
         except Exception as e:
-            processing_time = time.time() - start_time
-            error_msg = str(e)
-            logger.error(f"Error processing {image_path}: {error_msg}")
-
+            logger.error(f"Error processing {image_path}: {e}")
             return OCRResult(
                 file_path=image_path,
                 text="",
                 success=False,
-                error=error_msg,
-                processing_time=processing_time,
+                error=str(e),
+                processing_time=time.time() - start_time,
             )
 
     def process_pdf(
         self,
         pdf_path: Path,
         task: str = "convert",
-        custom_prompt: Optional[str] = None,
+        custom_prompt: str | None = None,
         show_progress: bool = True,
     ) -> OCRResult:
-        """Process a PDF file using native Gemini PDF support.
-
-        This method uploads the entire PDF to Gemini's Files API and processes
-        it in a single API call, which is faster and more accurate than
-        converting to images page-by-page.
-
-        Args:
-            pdf_path: Path to the PDF file
-            task: OCR task type
-            custom_prompt: Optional custom prompt
-            show_progress: Whether to show progress indicator
-
-        Returns:
-            OCRResult with extracted text
-        """
+        """Process a PDF file using native Gemini PDF support."""
         start_time = time.time()
         self.config.validate_file_size(pdf_path)
 
         try:
-            # Upload PDF to Gemini Files API
-            if show_progress:
+            if show_progress and not self.config.quiet:
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -249,15 +215,13 @@ class OCRProcessor:
                     progress.add_task("Uploading PDF...", total=None)
                     uploaded_file = self._upload_file(pdf_path)
                     progress.update(progress.task_ids[0], description="Processing...")
-
                     prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-                    text = self._generate_content([uploaded_file], prompt)
+                    text = self._call_with_retry([uploaded_file], prompt)
             else:
                 uploaded_file = self._upload_file(pdf_path)
                 prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-                text = self._generate_content([uploaded_file], prompt)
+                text = self._call_with_retry([uploaded_file], prompt)
 
-            # Extract embedded images if configured
             extracted_images = []
             if self.config.include_images:
                 try:
@@ -265,141 +229,71 @@ class OCRProcessor:
                 except Exception as e:
                     logger.warning(f"Failed to extract embedded images: {e}")
 
-            processing_time = time.time() - start_time
-
             return OCRResult(
                 file_path=pdf_path,
                 text=text,
                 success=True,
-                processing_time=processing_time,
+                processing_time=time.time() - start_time,
                 extracted_images=extracted_images,
             )
-
         except Exception as e:
-            processing_time = time.time() - start_time
-            error_msg = str(e)
-            logger.error(f"Error processing {pdf_path}: {error_msg}")
-
+            logger.error(f"Error processing {pdf_path}: {e}")
             return OCRResult(
                 file_path=pdf_path,
                 text="",
                 success=False,
-                error=error_msg,
-                processing_time=processing_time,
+                error=str(e),
+                processing_time=time.time() - start_time,
             )
-
-    def describe_figure(self, image_path: Path) -> str:
-        """Generate a detailed description of a figure/chart.
-
-        Args:
-            image_path: Path to the image file
-
-        Returns:
-            Detailed description of the figure
-        """
-        image = Image.open(image_path)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        image_part = self._pil_to_part(image)
-        return self._generate_content([image_part], OCR_PROMPTS["describe_figure"])
 
     def process_file(
         self,
         file_path: Path,
         task: str = "convert",
-        custom_prompt: Optional[str] = None,
+        custom_prompt: str | None = None,
         show_progress: bool = True,
     ) -> OCRResult:
-        """Process a single file (image or PDF).
-
-        Args:
-            file_path: Path to the file
-            task: OCR task type
-            custom_prompt: Optional custom prompt
-            show_progress: Whether to show progress
-
-        Returns:
-            OCRResult with extracted text
-        """
+        """Process a single file (image or PDF)."""
         if is_pdf_file(file_path):
             return self.process_pdf(
-                file_path,
-                task=task,
-                custom_prompt=custom_prompt,
-                show_progress=show_progress,
+                file_path, task=task, custom_prompt=custom_prompt, show_progress=show_progress
             )
         elif is_image_file(file_path):
-            return self.process_image(
-                file_path,
-                task=task,
-                custom_prompt=custom_prompt,
-            )
+            return self.process_image(file_path, task=task, custom_prompt=custom_prompt)
         else:
             raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
-    def save_results(
-        self,
-        result: OCRResult,
-        output_dir: Path,
-    ) -> Path:
-        """Save OCR results to files.
+    def save_results(self, result: OCRResult, output_dir: Path) -> Path:
+        """Save OCR results to per-document folder.
 
-        Args:
-            result: OCRResult to save
-            output_dir: Directory to save results
-
-        Returns:
-            Path to the saved markdown file
+        Output structure:
+            output_dir/doc_name/doc_name.md
+            output_dir/doc_name/figures/page1_img1.png
         """
         base_name = sanitize_filename(result.file_path.stem)
-        markdown_path = output_dir / f"{base_name}.md"
+        doc_dir = output_dir / base_name
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        markdown_path = doc_dir / f"{base_name}.md"
 
         # Save original image if configured
         if self.config.save_original_images and is_image_file(result.file_path):
-            originals_dir = output_dir / "original_images"
-            originals_dir.mkdir(parents=True, exist_ok=True)
-            original_output = originals_dir / f"{base_name}{result.file_path.suffix}"
+            original_output = doc_dir / f"{base_name}{result.file_path.suffix}"
             shutil.copy2(result.file_path, original_output)
 
-        # Build markdown content
-        content = []
-        content.append(f"# OCR Results\n")
-        content.append(f"**Original File:** {result.file_path.name}\n")
-        content.append(f"**Full Path:** `{result.file_path}`\n")
-        content.append(f"**Processed:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        content.append(f"**Processing Time:** {result.processing_time:.2f}s\n")
-        content.append("\n---\n\n")
+        # Write clean markdown — just the OCR text, no headers
+        markdown_path.write_text(
+            result.text if result.success else f"*[OCR Failed: {result.error}]*", encoding="utf-8"
+        )
 
-        # Add extracted content
-        if result.success:
-            content.append(result.text)
-            content.append("\n\n")
-        else:
-            content.append(f"*[OCR Failed: {result.error}]*\n\n")
-
-        # Save extracted images if any
+        # Save extracted images
         if result.extracted_images and self.config.include_images:
-            images_dir = output_dir / "extracted_images"
-            images_dir.mkdir(parents=True, exist_ok=True)
-
-            content.append("## Extracted Images\n\n")
-
+            figures_dir = doc_dir / "figures"
+            figures_dir.mkdir(parents=True, exist_ok=True)
             for img_info in result.extracted_images:
-                img_filename = (
-                    f"{base_name}_page{img_info['page']}_img{img_info['index']}.{img_info['ext']}"
-                )
-                img_path = images_dir / img_filename
-
+                img_filename = f"page{img_info['page']}_img{img_info['index']}.{img_info['ext']}"
+                img_path = figures_dir / img_filename
                 with open(img_path, "wb") as f:
                     f.write(img_info["data"])
-
-                content.append(f"![Page {img_info['page']} Image {img_info['index']}]")
-                content.append(f"(./extracted_images/{img_filename})\n\n")
-
-        # Write markdown
-        with open(markdown_path, "w", encoding="utf-8") as f:
-            f.write("".join(content))
 
         if self.config.verbose:
             console.print(f"[green]Saved:[/green] {markdown_path}")
@@ -409,60 +303,32 @@ class OCRProcessor:
     def process(
         self,
         input_path: Path,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
         task: str = "convert",
-        custom_prompt: Optional[str] = None,
-        add_timestamp: bool = False,
+        custom_prompt: str | None = None,
         reprocess: bool = False,
     ) -> None:
-        """Process input path (file or directory).
-
-        Args:
-            input_path: Path to file or directory
-            output_path: Optional output directory
-            task: OCR task type
-            custom_prompt: Optional custom prompt
-            add_timestamp: Add timestamp to output folder
-            reprocess: Reprocess already-processed files
-        """
+        """Process input path (file or directory)."""
         if input_path.is_file():
-            self._process_single_file(
-                input_path,
-                output_path,
-                task,
-                custom_prompt,
-                add_timestamp,
-                reprocess,
-            )
+            self._process_single_file(input_path, output_path, task, custom_prompt, reprocess)
         elif input_path.is_dir():
-            self._process_directory(
-                input_path,
-                output_path,
-                task,
-                custom_prompt,
-                add_timestamp,
-                reprocess,
-            )
+            self._process_directory(input_path, output_path, task, custom_prompt, reprocess)
         else:
             raise ValueError(f"Input path does not exist: {input_path}")
 
     def _process_single_file(
         self,
         file_path: Path,
-        output_path: Optional[Path],
+        output_path: Path | None,
         task: str,
-        custom_prompt: Optional[str],
-        add_timestamp: bool,
+        custom_prompt: str | None,
         reprocess: bool,
     ) -> None:
         """Process a single file."""
-        output_dir = determine_output_path(file_path, output_path, add_timestamp)
+        output_dir = determine_output_path(file_path, output_path)
+        meta = MetadataManager(output_dir)
 
-        # Check if already processed
-        existing = load_metadata(output_dir)
-        existing_files = {item["file"] for item in existing["files_processed"]}
-
-        if str(file_path) in existing_files and not reprocess:
+        if meta.is_processed(file_path) and not reprocess:
             console.print(f"[yellow]Already processed:[/yellow] {file_path.name}")
             console.print("[dim]Use --reprocess to force reprocessing[/dim]")
             return
@@ -474,45 +340,38 @@ class OCRProcessor:
 
         if result.success:
             output_file = self.save_results(result, output_dir)
-            self.processed_files.append(
-                {
-                    "file": str(file_path),
-                    "size": file_path.stat().st_size,
-                    "output": str(output_file),
-                    "pages": result.total_pages,
-                }
+            meta.record(
+                file_path,
+                processing_time=result.processing_time,
+                model=self.model_name,
+                output_path=str(output_file.relative_to(output_dir)),
             )
-            save_metadata(output_dir, self.processed_files, result.processing_time, self.errors)
-            console.print(f"\n[green]Success[/green]")
+            console.print("\n[green]Success[/green]")
             console.print(f"[dim]Time: {result.processing_time:.2f}s[/dim]")
         else:
-            self.errors.append({"file": str(file_path), "error": result.error})
             console.print(f"\n[red]Failed to process file: {result.error}[/red]")
 
     def _process_directory(
         self,
         dir_path: Path,
-        output_path: Optional[Path],
+        output_path: Path | None,
         task: str,
-        custom_prompt: Optional[str],
-        add_timestamp: bool,
+        custom_prompt: str | None,
         reprocess: bool,
     ) -> None:
         """Process all files in a directory."""
         files = get_supported_files(dir_path)
-
         if not files:
             console.print("[yellow]No supported files found[/yellow]")
             return
 
-        output_dir = determine_output_path(dir_path, output_path, add_timestamp)
-        existing = load_metadata(output_dir)
-        existing_files = {item["file"] for item in existing["files_processed"]}
+        output_dir = determine_output_path(dir_path, output_path)
+        meta = MetadataManager(output_dir)
 
         # Filter files
         files_to_process = []
         for f in files:
-            if str(f) in existing_files and not reprocess:
+            if meta.is_processed(f) and not reprocess:
                 if self.config.verbose:
                     console.print(f"[dim]Skipping: {f.name}[/dim]")
             else:
@@ -529,32 +388,85 @@ class OCRProcessor:
         start_time = time.time()
         success_count = 0
 
-        for file_path in files_to_process:
-            file_size = format_file_size(file_path.stat().st_size)
-            console.print(f"[cyan]{file_path.name}[/cyan] ({file_size})")
+        if self.config.max_workers > 1:
+            success_count = self._process_directory_concurrent(
+                files_to_process, output_dir, meta, task, custom_prompt
+            )
+        else:
+            for file_path in files_to_process:
+                file_size = format_file_size(file_path.stat().st_size)
+                console.print(f"[cyan]{file_path.name}[/cyan] ({file_size})")
 
-            result = self.process_file(file_path, task=task, custom_prompt=custom_prompt)
+                result = self.process_file(file_path, task=task, custom_prompt=custom_prompt)
 
-            if result.success:
-                output_file = self.save_results(result, output_dir)
-                self.processed_files.append(
-                    {
-                        "file": str(file_path),
-                        "size": file_path.stat().st_size,
-                        "output": str(output_file),
-                        "pages": result.total_pages,
-                    }
-                )
-                success_count += 1
-                console.print(f"  [green]OK[/green] ({result.processing_time:.1f}s)\n")
-            else:
-                self.errors.append({"file": str(file_path), "error": result.error})
-                console.print(f"  [red]FAILED[/red]\n")
+                if result.success:
+                    output_file = self.save_results(result, output_dir)
+                    with self._lock:
+                        meta.record(
+                            file_path,
+                            processing_time=result.processing_time,
+                            model=self.model_name,
+                            output_path=str(output_file.relative_to(output_dir)),
+                        )
+                    success_count += 1
+                    console.print(f"  [green]OK[/green] ({result.processing_time:.1f}s)\n")
+                else:
+                    console.print(f"  [red]FAILED: {result.error}[/red]\n")
 
         total_time = time.time() - start_time
-        save_metadata(output_dir, self.processed_files, total_time, self.errors)
-
         console.print(f"\n[green]Completed:[/green] {success_count}/{len(files_to_process)} files")
-        if self.errors:
-            console.print(f"[red]Errors:[/red] {len(self.errors)} file(s)")
         console.print(f"[dim]Total time: {total_time:.2f}s[/dim]")
+
+    def _process_directory_concurrent(
+        self,
+        files: list[Path],
+        output_dir: Path,
+        meta: MetadataManager,
+        task: str,
+        custom_prompt: str | None,
+    ) -> int:
+        """Process files concurrently with a thread pool."""
+        success_count = 0
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress_task = progress.add_task("Processing...", total=len(files))
+
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+                future_to_path = {
+                    executor.submit(self.process_file, f, task, custom_prompt, False): f
+                    for f in files
+                }
+
+                for future in as_completed(future_to_path):
+                    file_path = future_to_path[future]
+                    try:
+                        result = future.result()
+                        if result.success:
+                            output_file = self.save_results(result, output_dir)
+                            with self._lock:
+                                meta.record(
+                                    file_path,
+                                    processing_time=result.processing_time,
+                                    model=self.model_name,
+                                    output_path=str(output_file.relative_to(output_dir)),
+                                )
+                            success_count += 1
+                            console.print(
+                                f"  [green]OK[/green] {file_path.name} ({result.processing_time:.1f}s)"
+                            )
+                        else:
+                            console.print(f"  [red]FAILED[/red] {file_path.name}: {result.error}")
+                    except Exception as e:
+                        console.print(f"  [red]ERROR[/red] {file_path.name}: {e}")
+
+                    progress.advance(progress_task)
+
+        return success_count

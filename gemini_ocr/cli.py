@@ -3,7 +3,6 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -12,7 +11,14 @@ from rich.table import Table
 from gemini_ocr import __version__
 from gemini_ocr.config import Config
 from gemini_ocr.processor import OCRProcessor
-from gemini_ocr.utils import setup_logging
+from gemini_ocr.processor import console as proc_console
+from gemini_ocr.utils import (
+    format_file_size,
+    get_pdf_page_count,
+    get_supported_files,
+    is_pdf_file,
+    setup_logging,
+)
 
 console = Console()
 
@@ -20,34 +26,14 @@ console = Console()
 ORIGINAL_CWD = os.environ.get("GEMINI_OCR_CWD", os.getcwd())
 
 
-def print_banner() -> None:
-    """Print CLI banner."""
-    console.print(f"[bold blue]Gemini OCR[/bold blue] [dim]v{__version__}[/dim]")
-    console.print("[dim]Powered by Google Gemini[/dim]\n")
+def _resolve_path(path: Path) -> Path:
+    """Resolve a path relative to the original working directory."""
+    if not path.is_absolute():
+        return Path(ORIGINAL_CWD) / path
+    return path
 
 
-@click.group()
-@click.version_option(version=__version__, prog_name="gemini-ocr")
-@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
-@click.pass_context
-def cli(ctx: click.Context, verbose: bool) -> None:
-    """Gemini OCR - Document processing using Google Gemini's vision capabilities.
-
-    Process PDF and image files with state-of-the-art OCR, extracting text,
-    tables, equations, and figures with high accuracy.
-
-    \b
-    Examples:
-        gemini-ocr process document.pdf
-        gemini-ocr process ./papers/ --recursive
-        gemini-ocr describe figure.png
-    """
-    ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
-    setup_logging(verbose=verbose)
-
-
-@cli.command()
+@click.command()
 @click.argument("input_path", type=click.Path(path_type=Path))
 @click.option(
     "-o",
@@ -64,12 +50,12 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option(
     "--model",
     type=str,
-    default="gemini-3.0-flash",
-    help="Gemini model to use (default: gemini-3.0-flash)",
+    default="gemini-3.1-flash-lite-preview",
+    help="Gemini model to use (default: gemini-3.1-flash-lite-preview)",
 )
 @click.option(
     "--task",
-    type=click.Choice(["convert", "extract", "table"]),
+    type=click.Choice(["convert", "extract", "table", "describe_figure"]),
     default="convert",
     help="OCR task type (default: convert)",
 )
@@ -86,12 +72,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option(
     "--save-originals/--no-save-originals",
     default=True,
-    help="Save original input images (default: True)",
-)
-@click.option(
-    "--add-timestamp/--no-timestamp",
-    default=False,
-    help="Add timestamp to output folder (default: False)",
+    help="Save original input images alongside results (default: True)",
 )
 @click.option(
     "--reprocess",
@@ -99,61 +80,96 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     help="Reprocess files even if already done",
 )
 @click.option(
+    "--dry-run",
+    is_flag=True,
+    help="List files that would be processed without calling API",
+)
+@click.option(
+    "-q",
+    "--quiet",
+    is_flag=True,
+    help="Suppress output except file paths (for scripting)",
+)
+@click.option(
+    "-w",
+    "--workers",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Number of concurrent workers (default: 1)",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose output",
+)
+@click.option(
     "--env-file",
     type=click.Path(exists=True, path_type=Path),
     help="Path to .env file with configuration",
 )
-@click.pass_context
-def process(
-    ctx: click.Context,
+@click.option(
+    "--info",
+    is_flag=True,
+    help="Show configuration and system information",
+)
+@click.version_option(version=__version__, prog_name="gemini-ocr")
+def cli(
     input_path: Path,
-    output_dir: Optional[Path],
-    api_key: Optional[str],
+    output_dir: Path | None,
+    api_key: str | None,
     model: str,
     task: str,
-    prompt: Optional[str],
+    prompt: str | None,
     include_images: bool,
     save_originals: bool,
-    add_timestamp: bool,
     reprocess: bool,
-    env_file: Optional[Path],
+    dry_run: bool,
+    quiet: bool,
+    workers: int,
+    verbose: bool,
+    env_file: Path | None,
+    info: bool,
 ) -> None:
-    """Process documents and images with OCR.
+    """Gemini OCR - Document processing using Google Gemini.
 
-    INPUT_PATH can be a single file or directory.
-
-    \b
-    Supported formats:
-      - Images: JPG, PNG, WEBP, GIF, BMP, TIFF
-      - Documents: PDF
+    Process PDF and image files with state-of-the-art OCR.
 
     \b
     Examples:
-        # Process a single PDF
-        gemini-ocr process paper.pdf
-
-        # Process directory with custom output
-        gemini-ocr process ./documents -o ./results
-
-        # Use specific model
-        gemini-ocr process doc.pdf --model gemini-1.5-pro
-
-        # Custom OCR prompt
-        gemini-ocr process form.jpg --prompt "Extract all form fields"
+        gemini-ocr paper.pdf
+        gemini-ocr ./papers/ -o ./results/
+        gemini-ocr doc.pdf --model gemini-3.1-pro
+        gemini-ocr chart.png --task describe_figure
+        gemini-ocr --info
     """
-    print_banner()
+    setup_logging(verbose=verbose)
+
+    # Handle --info flag
+    if info:
+        _show_info(api_key)
+        return
+
+    # Resolve paths
+    input_path = _resolve_path(input_path)
+    if not input_path.exists():
+        console.print(f"[red]Error:[/red] Input path does not exist: {input_path}")
+        sys.exit(1)
+
+    if output_dir:
+        output_dir = _resolve_path(output_dir)
+
+    # Set quiet mode on processor console too
+    if quiet:
+        proc_console.quiet = True
+        console.quiet = True
+
+    # Handle --dry-run (no API key needed)
+    if dry_run:
+        _dry_run(input_path)
+        return
 
     try:
-        # Resolve paths relative to original CWD
-        if not input_path.is_absolute():
-            input_path = Path(ORIGINAL_CWD) / input_path
-
-        if not input_path.exists():
-            raise ValueError(f"Input path does not exist: {input_path}")
-
-        if output_dir and not output_dir.is_absolute():
-            output_dir = Path(ORIGINAL_CWD) / output_dir
-
         # Load configuration
         if env_file:
             config = Config.from_env(env_file)
@@ -166,20 +182,25 @@ def process(
         config.model = model
         config.include_images = include_images
         config.save_original_images = save_originals
-        config.verbose = ctx.obj["verbose"]
+        config.verbose = verbose
+        config.quiet = quiet
+        config.max_workers = workers
 
-        # Create processor and run
+        if not quiet:
+            console.print(f"[bold blue]Gemini OCR[/bold blue] [dim]v{__version__}[/dim]")
+            console.print(f"[dim]Model: {config.model}[/dim]\n")
+
         processor = OCRProcessor(config)
         processor.process(
             input_path,
             output_path=output_dir,
             task=task,
             custom_prompt=prompt,
-            add_timestamp=add_timestamp,
             reprocess=reprocess,
         )
 
-        console.print("\n[bold green]Done![/bold green]\n")
+        if not quiet:
+            console.print("\n[bold green]Done![/bold green]\n")
 
     except ValueError as e:
         console.print(f"\n[red]Error:[/red] {e}\n")
@@ -189,134 +210,78 @@ def process(
         sys.exit(130)
     except Exception as e:
         console.print(f"\n[red]Error:[/red] {e}\n")
-        if ctx.obj["verbose"]:
+        if verbose:
             import traceback
+
             traceback.print_exc()
         sys.exit(1)
 
 
-@cli.command()
-@click.argument("image_path", type=click.Path(exists=True, path_type=Path))
-@click.option(
-    "--api-key",
-    type=str,
-    envvar="GEMINI_API_KEY",
-    help="Gemini API key",
-)
-@click.option(
-    "--model",
-    type=str,
-    default="gemini-2.0-flash",
-    help="Gemini model to use",
-)
-@click.option(
-    "-o",
-    "--output",
-    type=click.Path(path_type=Path),
-    help="Output file for description (default: stdout)",
-)
-@click.pass_context
-def describe(
-    ctx: click.Context,
-    image_path: Path,
-    api_key: Optional[str],
-    model: str,
-    output: Optional[Path],
-) -> None:
-    """Generate detailed description of a figure/chart/diagram.
+def _dry_run(input_path: Path) -> None:
+    """List files that would be processed without calling the API."""
+    if input_path.is_file():
+        files = [input_path]
+    else:
+        files = get_supported_files(input_path)
 
-    Analyzes the image and provides structured description including:
-    - Type of visualization
-    - Axes, labels, components
-    - Data/information conveyed
-    - Key findings
+    if not files:
+        console.print("[yellow]No supported files found[/yellow]")
+        return
 
-    \b
-    Examples:
-        gemini-ocr describe chart.png
-        gemini-ocr describe diagram.jpg -o description.md
-    """
-    print_banner()
+    table = Table(title="Files to process (dry run)")
+    table.add_column("File", style="cyan")
+    table.add_column("Size", justify="right")
+    table.add_column("Pages", justify="right")
 
-    try:
-        # Resolve path
-        if not image_path.is_absolute():
-            image_path = Path(ORIGINAL_CWD) / image_path
+    total_size = 0
+    for f in files:
+        size = f.stat().st_size
+        total_size += size
+        pages = str(get_pdf_page_count(f)) if is_pdf_file(f) else "-"
+        table.add_row(f.name, format_file_size(size), pages)
 
-        if api_key:
-            os.environ["GEMINI_API_KEY"] = api_key
-
-        config = Config.from_env()
-        config.model = model
-        config.verbose = ctx.obj["verbose"]
-
-        processor = OCRProcessor(config)
-
-        console.print(f"[blue]Analyzing:[/blue] {image_path.name}\n")
-
-        description = processor.describe_figure(image_path)
-
-        if output:
-            if not output.is_absolute():
-                output = Path(ORIGINAL_CWD) / output
-            output.write_text(description, encoding="utf-8")
-            console.print(f"[green]Saved to:[/green] {output}")
-        else:
-            console.print("[bold]Description:[/bold]\n")
-            console.print(description)
-
-        console.print("\n[bold green]Done![/bold green]\n")
-
-    except Exception as e:
-        console.print(f"\n[red]Error:[/red] {e}\n")
-        if ctx.obj["verbose"]:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(files)} file(s), {format_file_size(total_size)}[/dim]")
 
 
-@cli.command()
-def info() -> None:
+def _show_info(api_key: str | None = None) -> None:
     """Show configuration and system information."""
-    print_banner()
+    console.print(f"[bold blue]Gemini OCR[/bold blue] [dim]v{__version__}[/dim]\n")
 
-    # System info
     sys_table = Table(title="System Information")
     sys_table.add_column("Component", style="cyan")
     sys_table.add_column("Value", style="green")
-
-    sys_table.add_row("Python", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    sys_table.add_row(
+        "Python",
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    )
     sys_table.add_row("Platform", sys.platform)
-
     console.print(sys_table)
     console.print()
 
-    # Configuration
     try:
+        if api_key:
+            os.environ["GEMINI_API_KEY"] = api_key
         config = Config.from_env()
 
         config_table = Table(title="Configuration")
         config_table.add_column("Setting", style="cyan")
         config_table.add_column("Value", style="yellow")
-
         config_table.add_row("API Key", "Set" if config.api_key else "[red]Not set[/red]")
         config_table.add_row("Model", config.model)
-        config_table.add_row("DPI", str(config.dpi))
         config_table.add_row("Max File Size", f"{config.max_file_size_mb} MB")
         config_table.add_row("Include Images", str(config.include_images))
-
         console.print(config_table)
         console.print()
 
-        # Test API if key is set
         if config.api_key:
             console.print("[dim]Testing API connection...[/dim]")
             try:
                 from google import genai
+
                 client = genai.Client(api_key=config.api_key)
-                # Try to list models to verify connection
                 models = list(client.models.list())
-                console.print(f"[green]API connection successful[/green]")
+                console.print("[green]API connection successful[/green]")
                 console.print(f"[dim]Available models: {len(models)}[/dim]")
             except Exception as e:
                 console.print(f"[red]API connection failed:[/red] {e}")
@@ -334,33 +299,15 @@ def info() -> None:
 
 
 def main() -> None:
-    """Entry point with shorthand support.
-
-    Allows `gemini-ocr file.pdf` as shorthand for `gemini-ocr process file.pdf`
-    """
+    """Entry point — handles bare invocations and delegates to cli()."""
     argv = sys.argv[1:]
 
-    if argv:
-        known_commands = {"process", "describe", "info"}
+    # If no args at all, show help
+    if not argv:
+        cli(["--help"])
+        return
 
-        # Find first non-option argument
-        first_arg_idx = None
-        for idx, arg in enumerate(argv):
-            if not arg.startswith("-"):
-                first_arg_idx = idx
-                break
-
-        # If it's a file path, insert "process" command
-        if first_arg_idx is not None:
-            candidate = argv[first_arg_idx]
-            if candidate not in known_commands:
-                # Check if it looks like a path
-                potential_path = Path(ORIGINAL_CWD) / candidate if not Path(candidate).is_absolute() else Path(candidate)
-                if potential_path.exists():
-                    argv = argv[:first_arg_idx] + ["process"] + argv[first_arg_idx:]
-                    sys.argv = [sys.argv[0], *argv]
-
-    cli(obj={})
+    cli()
 
 
 if __name__ == "__main__":

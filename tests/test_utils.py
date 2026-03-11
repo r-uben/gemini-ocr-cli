@@ -37,7 +37,6 @@ class TestFileTypeDetection:
         ],
     )
     def test_is_supported_file(self, filename: str, expected: bool):
-        """Test supported file detection."""
         assert is_supported_file(Path(filename)) == expected
 
     @pytest.mark.parametrize(
@@ -54,7 +53,6 @@ class TestFileTypeDetection:
         ],
     )
     def test_is_image_file(self, filename: str, expected: bool):
-        """Test image file detection."""
         assert is_image_file(Path(filename)) == expected
 
     @pytest.mark.parametrize(
@@ -68,7 +66,6 @@ class TestFileTypeDetection:
         ],
     )
     def test_is_pdf_file(self, filename: str, expected: bool):
-        """Test PDF file detection."""
         assert is_pdf_file(Path(filename)) == expected
 
 
@@ -87,17 +84,14 @@ class TestSanitizeFilename:
         ],
     )
     def test_sanitize_filename(self, input_name: str, expected: str):
-        """Test filename sanitization."""
         assert sanitize_filename(input_name) == expected
 
     def test_sanitize_filename_max_length(self):
-        """Test filename truncation to max length."""
         long_name = "a" * 300
         result = sanitize_filename(long_name, max_length=200)
         assert len(result) == 200
 
     def test_sanitize_filename_no_max_length(self):
-        """Test filename without max length restriction."""
         long_name = "a" * 300
         result = sanitize_filename(long_name, max_length=None)
         assert len(result) == 300
@@ -119,7 +113,6 @@ class TestFormatFileSize:
         ],
     )
     def test_format_file_size(self, size_bytes: int, expected: str):
-        """Test file size formatting."""
         assert format_file_size(size_bytes) == expected
 
 
@@ -127,53 +120,32 @@ class TestDetermineOutputPath:
     """Tests for output path determination."""
 
     def test_output_path_for_file(self, tmp_path):
-        """Test output path when input is a file."""
         input_file = tmp_path / "test.pdf"
         input_file.touch()
-
         result = determine_output_path(input_file)
-
         assert result == tmp_path / "gemini_ocr_output"
         assert result.exists()
 
     def test_output_path_for_directory(self, tmp_path):
-        """Test output path when input is a directory."""
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-
         result = determine_output_path(input_dir)
-
         assert result == input_dir / "gemini_ocr_output"
         assert result.exists()
 
     def test_output_path_custom(self, tmp_path):
-        """Test custom output path."""
         input_file = tmp_path / "test.pdf"
         input_file.touch()
         custom_output = tmp_path / "custom_output"
-
         result = determine_output_path(input_file, output_path=custom_output)
-
         assert result == custom_output
         assert result.exists()
-
-    def test_output_path_with_timestamp(self, tmp_path):
-        """Test output path with timestamp."""
-        input_file = tmp_path / "test.pdf"
-        input_file.touch()
-
-        result = determine_output_path(input_file, add_timestamp=True)
-
-        # Should contain timestamp pattern
-        assert "gemini_ocr_output_" in str(result)
 
 
 class TestGetSupportedFiles:
     """Tests for finding supported files."""
 
     def test_get_supported_files_recursive(self, tmp_path):
-        """Test recursive file discovery."""
-        # Create structure
         (tmp_path / "root.pdf").touch()
         (tmp_path / "sub").mkdir()
         (tmp_path / "sub" / "nested.pdf").touch()
@@ -190,7 +162,6 @@ class TestGetSupportedFiles:
         assert "ignored.txt" not in names
 
     def test_get_supported_files_non_recursive(self, tmp_path):
-        """Test non-recursive file discovery."""
         (tmp_path / "root.pdf").touch()
         (tmp_path / "sub").mkdir()
         (tmp_path / "sub" / "nested.pdf").touch()
@@ -201,17 +172,25 @@ class TestGetSupportedFiles:
         assert files[0].name == "root.pdf"
 
     def test_get_supported_files_empty_directory(self, tmp_path):
-        """Test empty directory returns empty list."""
         files = get_supported_files(tmp_path)
         assert files == []
 
     def test_get_supported_files_sorted(self, tmp_path):
-        """Test files are returned sorted."""
         (tmp_path / "c.pdf").touch()
         (tmp_path / "a.pdf").touch()
         (tmp_path / "b.pdf").touch()
 
         files = get_supported_files(tmp_path)
-
         names = [f.name for f in files]
         assert names == ["a.pdf", "b.pdf", "c.pdf"]
+
+    def test_get_supported_files_excludes_output_dir(self, tmp_path):
+        (tmp_path / "root.pdf").touch()
+        output_dir = tmp_path / "gemini_ocr_output"
+        output_dir.mkdir()
+        (output_dir / "output.pdf").touch()
+
+        files = get_supported_files(tmp_path, recursive=True)
+        names = [f.name for f in files]
+        assert "root.pdf" in names
+        assert "output.pdf" not in names

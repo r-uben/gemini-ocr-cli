@@ -2,7 +2,6 @@
 
 import os
 from pathlib import Path
-from typing import Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,7 +17,7 @@ class Config(BaseSettings):
         extra="ignore",
     )
 
-    # API Configuration - checks GEMINI_API_KEY first, then GOOGLE_API_KEY
+    # API Configuration
     api_key: str = Field(default="", description="Google Gemini API key")
 
     @field_validator("api_key", mode="before")
@@ -31,23 +30,19 @@ class Config(BaseSettings):
         2. GEMINI_API_KEY environment variable
         3. GOOGLE_API_KEY environment variable (fallback)
         """
-        if v:  # Explicitly provided value
+        if v:
             return v
-
-        # Check environment variables
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         if gemini_key:
             return gemini_key
-
         google_key = os.environ.get("GOOGLE_API_KEY", "")
         if google_key:
             return google_key
-
         return ""
 
     # Model Configuration
     model: str = Field(
-        default="gemini-3.0-flash",
+        default="gemini-3.1-flash-lite-preview",
         description="Gemini model to use for OCR",
     )
 
@@ -60,40 +55,40 @@ class Config(BaseSettings):
         default=True,
         description="Save original input images alongside results",
     )
-    dpi: int = Field(
-        default=200,
-        description="DPI for PDF rendering",
-    )
     max_file_size_mb: float = Field(
-        default=20.0,
+        default=50.0,
         description="Maximum file size in MB",
     )
 
+    # Concurrency
+    max_workers: int = Field(default=1, description="Number of concurrent workers")
+    max_retries: int = Field(default=3, description="Max retry attempts for transient errors")
+    retry_base_delay: float = Field(default=1.0, description="Base delay for exponential backoff")
+
     # Output Configuration
-    output_dir: Optional[Path] = Field(
+    output_dir: Path | None = Field(
         default=None,
         description="Default output directory",
     )
 
     # Runtime
     verbose: bool = Field(default=False, description="Enable verbose output")
+    quiet: bool = Field(default=False, description="Suppress all output except paths")
 
     @classmethod
-    def from_env(cls, env_file: Optional[Path] = None) -> "Config":
+    def from_env(cls, env_file: Path | None = None) -> "Config":
         """Load configuration from environment or .env file."""
         if env_file and env_file.exists():
             from dotenv import load_dotenv
 
             load_dotenv(env_file)
-
         return cls()
 
     def validate_api_key(self) -> None:
         """Validate that API key is set."""
         if not self.api_key:
             raise ValueError(
-                "Gemini API key not set. "
-                "Set GEMINI_API_KEY environment variable or pass --api-key"
+                "Gemini API key not set. Set GEMINI_API_KEY environment variable or pass --api-key"
             )
 
     def validate_file_size(self, file_path: Path) -> None:
