@@ -50,8 +50,8 @@ def _resolve_path(path: Path) -> Path:
 @click.option(
     "--model",
     type=str,
-    default="gemini-3.1-flash-lite-preview",
-    help="Gemini model to use (default: gemini-3.1-flash-lite-preview)",
+    default="gemini-3-flash-preview",
+    help="Gemini model to use (default: gemini-3-flash-preview)",
 )
 @click.option(
     "--task",

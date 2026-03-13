@@ -42,7 +42,7 @@ class Config(BaseSettings):
 
     # Model Configuration
     model: str = Field(
-        default="gemini-3.1-flash-lite-preview",
+        default="gemini-3-flash-preview",
         description="Gemini model to use for OCR",
     )
 
