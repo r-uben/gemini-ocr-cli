@@ -35,15 +35,7 @@ console = Console()
 
 # OCR prompts for different tasks
 OCR_PROMPTS = {
-    "convert": """Extract all text from this document and convert it to clean markdown format.
-
-Rules:
-- Preserve the document structure (headings, paragraphs, lists, tables)
-- Convert tables to markdown table format
-- Preserve mathematical equations in LaTeX format where possible
-- Include figure/image captions if present
-- Do not describe images, just note their presence as [Figure X] or [Image]
-- Output ONLY the extracted text in markdown, no commentary""",
+    "convert": "Convert this document to markdown. Preserve structure, tables, and equations in LaTeX. Note figures as [Figure N]. Output only the markdown.",
     "extract": """Extract all visible text from this document exactly as it appears.
 Output only the extracted text, preserving line breaks and spacing.""",
     "describe_figure": """Analyze this figure/chart/diagram in detail:
@@ -101,19 +93,32 @@ class OCRProcessor:
         error_str = str(error).lower()
         return "429" in error_str or "rate limit" in error_str or "quota" in error_str
 
+    def _build_generation_config(self) -> types.GenerateContentConfig:
+        """Build GenerateContentConfig, adding thinking config for 3.1+ models."""
+        kwargs: dict[str, Any] = {"temperature": 0.1}
+
+        # Gemini 3.1+ models use thinking architecture — needs explicit config
+        # to avoid empty responses (thinking stalls at temperature ~0)
+        if "3.1" in self.model_name or "flash-lite" in self.model_name:
+            kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level="MINIMAL",
+            )
+            kwargs["media_resolution"] = "MEDIA_RESOLUTION_HIGH"
+
+        return types.GenerateContentConfig(**kwargs)
+
     def _call_with_retry(self, contents: list[Any], prompt: str) -> str:
         """Call generate_content with exponential backoff on transient errors."""
         max_attempts = self.config.max_retries + 1
         base_delay = self.config.retry_base_delay
+        config = self._build_generation_config()
 
         for attempt in range(max_attempts):
             try:
                 response = self.client.models.generate_content(
                     model=self.model_name,
                     contents=[prompt, *contents],
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                    ),
+                    config=config,
                 )
                 if response.text:
                     return response.text.strip()
