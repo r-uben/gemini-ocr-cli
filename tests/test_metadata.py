@@ -40,7 +40,7 @@ class TestMetadataManager:
         f.write_bytes(b"fake pdf content")
 
         meta = MetadataManager(tmp_path)
-        meta.record(f, processing_time=1.5, model="gemini-3.1-flash-lite-preview", output_path="test/test.md")
+        meta.record(f, processing_time=1.5, model="gemini-3-flash-preview", output_path="test/test.md")
 
         assert meta.is_processed(f)
 
@@ -98,12 +98,12 @@ class TestMetadataManager:
         f.write_bytes(b"data")
 
         meta = MetadataManager(tmp_path)
-        meta.record(f, processing_time=2.5, model="gemini-3.1-flash-lite-preview", output_path="test/test.md")
+        meta.record(f, processing_time=2.5, model="gemini-3-flash-preview", output_path="test/test.md")
 
         entry = meta.files["test.pdf"]
         assert entry["status"] == "completed"
         assert entry["processing_time"] == 2.5
-        assert entry["model"] == "gemini-3.1-flash-lite-preview"
+        assert entry["model"] == "gemini-3-flash-preview"
         assert entry["output_path"] == "test/test.md"
         assert "checksum" in entry
         assert "timestamp" in entry

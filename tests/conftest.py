@@ -66,7 +66,7 @@ def mock_config():
     with patch.dict(os.environ, {"GEMINI_API_KEY": "test-api-key"}):
         config = Config()
         config.api_key = "test-api-key"
-        config.model = "gemini-3.1-flash-lite-preview"
+        config.model = "gemini-3-flash-preview"
         config.verbose = False
         config.quiet = False
         config.max_workers = 1

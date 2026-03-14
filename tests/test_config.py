@@ -55,7 +55,7 @@ class TestConfigDefaults:
     def test_default_model(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}, clear=True):
             config = Config()
-            assert config.model == "gemini-3.1-flash-lite-preview"
+            assert config.model == "gemini-3-flash-preview"
 
     def test_default_max_file_size(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}, clear=True):
