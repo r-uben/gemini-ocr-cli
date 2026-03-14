@@ -2,6 +2,7 @@
 
 import io
 import logging
+import re
 import shutil
 import threading
 import time
@@ -35,7 +36,12 @@ console = Console()
 
 # OCR prompts for different tasks
 OCR_PROMPTS = {
-    "convert": "Convert this document to markdown. Preserve structure, tables, and equations in LaTeX. Note figures as [Figure N]. Output only the markdown.",
+    "convert": """Convert this document into well-structured markdown.
+
+- Maintain headings, paragraphs, lists, and tables (use markdown table format).
+- Represent equations in LaTeX syntax.
+- Preserve figure captions as [Figure N: <caption>]. Do not describe figure contents.
+- Output only the resulting markdown, no commentary.""",
     "extract": """Extract all visible text from this document exactly as it appears.
 Output only the extracted text, preserving line breaks and spacing.""",
     "describe_figure": """Analyze this figure/chart/diagram in detail:
@@ -93,17 +99,19 @@ class OCRProcessor:
         error_str = str(error).lower()
         return "429" in error_str or "rate limit" in error_str or "quota" in error_str
 
+    # Gemini 3.x Flash models use thinking architecture and need explicit config
+    # to avoid empty responses (thinking stalls at low temperature).
+    # Does NOT match: gemini-2.x (different thinking API), gemini-3-pro (not Flash)
+    _GEMINI_3_FLASH_RE = re.compile(r"gemini-3(?:\.\d+)?-flash")
+
     def _build_generation_config(self) -> types.GenerateContentConfig:
-        """Build GenerateContentConfig, adding thinking config for 3.1+ models."""
+        """Build GenerateContentConfig, adding thinking config for Gemini 3 Flash models."""
         kwargs: dict[str, Any] = {"temperature": 0.1}
 
-        # Gemini 3.1+ models use thinking architecture — needs explicit config
-        # to avoid empty responses (thinking stalls at temperature ~0)
-        if "3.1" in self.model_name or "flash-lite" in self.model_name:
+        if self._GEMINI_3_FLASH_RE.search(self.model_name):
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_level="MINIMAL",
             )
-            kwargs["media_resolution"] = "MEDIA_RESOLUTION_HIGH"
 
         return types.GenerateContentConfig(**kwargs)
 
