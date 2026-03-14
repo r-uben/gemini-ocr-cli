@@ -23,7 +23,8 @@ from gemini_ocr.utils import (
 console = Console()
 
 # Get original working directory if set (for wrapper scripts)
-ORIGINAL_CWD = os.environ.get("GEMINI_OCR_CWD", os.getcwd())
+_cwd_override = os.environ.get("GEMINI_OCR_CWD", "")
+ORIGINAL_CWD = _cwd_override if _cwd_override and Path(_cwd_override).is_absolute() else os.getcwd()
 
 
 def _resolve_path(path: Path) -> Path:
@@ -174,9 +175,11 @@ def cli(
         if env_file:
             config = Config.from_env(env_file)
         else:
-            if api_key:
-                os.environ["GEMINI_API_KEY"] = api_key
             config = Config.from_env()
+
+        # Pass CLI api_key directly to config (don't pollute os.environ)
+        if api_key:
+            config.api_key = api_key
 
         # Override with CLI options
         config.model = model
@@ -213,7 +216,7 @@ def cli(
         if verbose:
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
 
@@ -260,9 +263,9 @@ def _show_info(api_key: str | None = None) -> None:
     console.print()
 
     try:
-        if api_key:
-            os.environ["GEMINI_API_KEY"] = api_key
         config = Config.from_env()
+        if api_key:
+            config.api_key = api_key
 
         config_table = Table(title="Configuration")
         config_table.add_column("Setting", style="cyan")

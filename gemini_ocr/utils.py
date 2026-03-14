@@ -56,10 +56,12 @@ def get_supported_files(directory: Path, recursive: bool = True) -> list[Path]:
 
 def sanitize_filename(filename: str, max_length: int | None = 200) -> str:
     """Sanitize filename for safe filesystem usage."""
-    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
+    # Strip null bytes and leading dots (prevent hidden files / path tricks)
+    sanitized = filename.replace("\x00", "")
+    sanitized = re.sub(r'[<>:"/\\|?*]', "_", sanitized)
     sanitized = re.sub(r"\s+", "_", sanitized)
     sanitized = re.sub(r"_+", "_", sanitized)
-    sanitized = sanitized.strip("_")
+    sanitized = sanitized.strip("_.")
     if max_length and len(sanitized) > max_length:
         sanitized = sanitized[:max_length]
     return sanitized or "unnamed"

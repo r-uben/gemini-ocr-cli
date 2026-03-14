@@ -217,6 +217,7 @@ class OCRProcessor:
         start_time = time.time()
         self.config.validate_file_size(pdf_path)
 
+        uploaded_file = None
         try:
             if show_progress and not self.config.quiet:
                 with Progress(
@@ -258,6 +259,13 @@ class OCRProcessor:
                 error=str(e),
                 processing_time=time.time() - start_time,
             )
+        finally:
+            # Clean up uploaded file from Gemini Files API (48hr retention)
+            if uploaded_file is not None:
+                try:
+                    self.client.files.delete(name=uploaded_file.name)
+                except Exception as del_err:
+                    logger.debug(f"Failed to delete uploaded file: {del_err}")
 
     def process_file(
         self,
@@ -294,9 +302,11 @@ class OCRProcessor:
             shutil.copy2(result.file_path, original_output)
 
         # Write clean markdown — just the OCR text, no headers
-        markdown_path.write_text(
-            result.text if result.success else f"*[OCR Failed: {result.error}]*", encoding="utf-8"
-        )
+        if result.success:
+            markdown_path.write_text(result.text, encoding="utf-8")
+        else:
+            # Sanitize error: don't leak raw exception details to output files
+            markdown_path.write_text("*[OCR Failed]*", encoding="utf-8")
 
         # Save extracted images
         if result.extracted_images and self.config.include_images:
