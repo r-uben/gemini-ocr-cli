@@ -7,6 +7,18 @@
 
 A command-line tool for OCR processing using Google Gemini's vision capabilities. Process PDFs and images to extract text, tables, equations, and figures.
 
+## Choosing an OCR tool
+
+This is one of five OCR CLI tools with a shared design: clean Markdown output, batch processing, and figure extraction. Pick based on your constraints:
+
+| Tool | Engine | Runs | Cost | Best for |
+|------|--------|------|------|----------|
+| [deepseek-ocr-cli](https://github.com/r-uben/deepseek-ocr-cli) | DeepSeek vision | Local (Ollama / vLLM) | Free | General-purpose local OCR with multi-backend flexibility |
+| **gemini-ocr-cli** (this repo) | Google Gemini | Cloud API | Free tier / Pay-per-use | Fast cloud OCR with concurrent processing |
+| [marker-ocr-cli](https://github.com/r-uben/marker-ocr-cli) | Marker (Surya + Texify) | Local | Free | Academic papers with equations, tables, complex layouts |
+| [mistral-ocr-cli](https://github.com/r-uben/mistral-ocr-cli) | Mistral OCR API | Cloud API | ~$1/1k pages | Structured extraction (tables, headers, footers) |
+| [nougat-ocr-cli](https://github.com/r-uben/nougat-ocr-cli) | Meta Nougat | Local (GPU) | Free | Academic papers, GPU-accelerated batch processing |
+
 ## Installation
 
 Requires Python 3.11+ and a [Google Gemini API key](https://aistudio.google.com/apikey).
