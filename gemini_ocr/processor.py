@@ -115,6 +115,37 @@ class OCRProcessor:
 
         return types.GenerateContentConfig(**kwargs)
 
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        """Extract text from a GenerateContentResponse by walking parts explicitly.
+
+        The `.text` shortcut returns None when parts include thought summaries,
+        non-text parts, or when finish_reason != STOP — which is common with
+        Gemini 3.x thinking models. Walking parts is the reliable path.
+        """
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            feedback = getattr(response, "prompt_feedback", None)
+            raise RuntimeError(f"Empty response: no candidates (prompt_feedback={feedback})")
+
+        candidate = candidates[0]
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        text = "".join(
+            p.text for p in parts if getattr(p, "text", None) and not getattr(p, "thought", False)
+        ).strip()
+
+        if not text:
+            finish = getattr(candidate, "finish_reason", None)
+            safety = getattr(candidate, "safety_ratings", None)
+            part_types = [type(p).__name__ for p in parts]
+            raise RuntimeError(
+                f"Empty response: finish_reason={finish}, "
+                f"len(parts)={len(parts)}, part_types={part_types}, "
+                f"safety_ratings={safety}"
+            )
+        return text
+
     def _call_with_retry(self, contents: list[Any], prompt: str) -> str:
         """Call generate_content with exponential backoff on transient errors."""
         max_attempts = self.config.max_retries + 1
@@ -128,9 +159,7 @@ class OCRProcessor:
                     contents=[prompt, *contents],
                     config=config,
                 )
-                if response.text:
-                    return response.text.strip()
-                return ""
+                return self._extract_text(response)
             except Exception as e:
                 is_last = attempt == max_attempts - 1
                 if is_last or not self._is_retryable(e):
