@@ -239,7 +239,7 @@ wheels = [
 
 [[package]]
 name = "gemini-ocr-cli"
-version = "0.3.0"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
