@@ -32,16 +32,18 @@ class TestConfigAPIKey:
 
     def test_api_key_empty_when_not_set(self):
         with patch.dict(os.environ, {}, clear=True):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+            env = {
+                k: v for k, v in os.environ.items() if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+            }
             with patch.dict(os.environ, env, clear=True):
                 config = Config()
                 assert config.api_key == ""
 
     def test_validate_api_key_raises_when_empty(self):
         with patch.dict(os.environ, {}, clear=True):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+            env = {
+                k: v for k, v in os.environ.items() if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+            }
             with patch.dict(os.environ, env, clear=True):
                 config = Config()
                 config.api_key = ""
@@ -109,8 +111,7 @@ class TestConfigFromEnv:
     def test_from_env_loads_dotenv(self, tmp_path):
         env_file = tmp_path / ".env"
         env_file.write_text("GEMINI_API_KEY=dotenv-key\n")
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+        env = {k: v for k, v in os.environ.items() if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
         with patch.dict(os.environ, env, clear=True):
             config = Config.from_env(env_file)
             assert config.api_key == "dotenv-key"

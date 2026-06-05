@@ -77,7 +77,7 @@ class TestSanitizeFilename:
         [
             ("normal_file", "normal_file"),
             ("file with spaces", "file_with_spaces"),
-            ("file<>:\"/\\|?*name", "file_name"),
+            ('file<>:"/\\|?*name', "file_name"),
             ("multiple   spaces", "multiple_spaces"),
             ("___leading_trailing___", "leading_trailing"),
             ("", "unnamed"),

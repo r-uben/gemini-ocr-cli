@@ -50,9 +50,7 @@ def retry(
                 except exceptions as e:
                     last_exception = e
                     if attempt == max_attempts:
-                        logger.error(
-                            f"All {max_attempts} attempts failed for {func.__name__}: {e}"
-                        )
+                        logger.error(f"All {max_attempts} attempts failed for {func.__name__}: {e}")
                         raise RetryError(
                             f"Failed after {max_attempts} attempts", last_exception
                         ) from e
