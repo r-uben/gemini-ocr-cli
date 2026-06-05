@@ -1,9 +1,30 @@
-"""Core OCR processing module using Google Gemini with native PDF support."""
+"""Core OCR processing module using Google Gemini.
+
+PDFs are processed in one of three modes, all routed through the ratified output
+contract (``docs/plans/00-output-contract/DECISION.md``):
+
+* **auto** (DEFAULT) — the whole PDF is uploaded once via the Gemini Files API
+  and OCR'd in a *single* call. The prompt asks the model to begin each page with
+  a ``## Page N`` header; the returned markdown is split on those markers to
+  recover per-page text. If that whole-PDF response looks truncated (a
+  length-limited finish reason, or fewer recovered pages than the PDF actually
+  has -- see :func:`is_truncated`), the document is automatically re-processed
+  page-by-page and that result is used instead, recorded non-silently in
+  metadata. This is the cost/quality-preferred default for academic PDFs.
+* **whole_pdf** (``--whole-pdf``) — a single whole-PDF call with NO fallback; the
+  caller accepts that a long document may be truncated.
+* **per_page** (``--per-page``) — each page is rendered to an image and OCR'd in
+  its own call, then joined under ``## Page N`` headers. Honest per-page failure
+  tracking at the cost of N calls per document.
+
+All three produce byte-identical *structure*: one ``<stem>.md`` with ``## Page
+N`` headers, no frontmatter, dual-level metadata, and the uniform exit policy.
+This module owns *how OCR happens*; the contract module owns *where bytes go*.
+"""
 
 import io
 import logging
 import re
-import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import fitz  # PyMuPDF
 from google import genai
 from google.genai import types
 from PIL import Image
@@ -18,23 +40,43 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
 from gemini_ocr.config import Config
-from gemini_ocr.metadata import MetadataManager
+from gemini_ocr.output_contract import (
+    DocMetadata,
+    RootIndex,
+    RunOutcome,
+    Status,
+    assemble_pages,
+    doc_dir_for,
+    figure_filename,
+    figure_markdown_link,
+    figures_dir_for,
+    markdown_path_for,
+    relative_key,
+    resolve_output_root,
+    sha256_checksum,
+    utc_timestamp,
+    write_doc_metadata,
+)
 from gemini_ocr.utils import (
-    determine_output_path,
     extract_pdf_images,
     format_file_size,
+    get_pdf_page_count,
     get_supported_files,
     is_image_file,
     is_pdf_file,
-    sanitize_filename,
 )
 
 logger = logging.getLogger(__name__)
 
+#: Backend identifier recorded in metadata. Gemini is a cloud API.
+BACKEND = "gemini-api"
+
 # Shared console instance — CLI sets .quiet on this directly
 console = Console()
 
-# OCR prompts for different tasks
+# OCR prompts for the per-page / single-image path. The contract module supplies
+# the ``## Page N`` headers when assembling per-page results, so these prompts ask
+# only for the page body.
 OCR_PROMPTS = {
     "convert": """Convert this document into well-structured markdown.
 
@@ -55,21 +97,159 @@ Provide a structured description.""",
 Preserve all data, headers, and structure. Output only the markdown tables.""",
 }
 
+#: Instruction appended to native whole-PDF prompts so the single returned blob
+#: carries explicit per-page boundaries we can split on. The model is asked to
+#: begin EACH source page with a ``## Page N`` header (1-indexed, matching the
+#: PDF's own page order), which we then parse back into per-page sections.
+_NATIVE_PAGE_MARKER_INSTRUCTION = (
+    "\n\nThis is a multi-page PDF. Process EVERY page, in order. Begin the "
+    "transcription of each source page with a level-2 markdown header of the "
+    'exact form "## Page N" on its own line, where N is the 1-indexed page '
+    "number (## Page 1 for the first page, ## Page 2 for the second, and so on). "
+    "Do not skip, merge, or renumber pages. Output only the resulting markdown."
+)
+
+# OCR prompts for the native whole-PDF path. Identical to the per-page prompts but
+# with the page-marker instruction appended so a single call yields page markers.
+OCR_PROMPTS_NATIVE = {
+    task: prompt + _NATIVE_PAGE_MARKER_INSTRUCTION for task, prompt in OCR_PROMPTS.items()
+}
+
+#: DPI used to rasterize PDF pages before sending them to Gemini (per-page mode).
+PDF_RENDER_DPI = 200
+
+#: Matches a ``## Page N`` boundary header at the start of a line. Used to split a
+#: native single-call response back into per-page sections. Tolerant of leading
+#: whitespace and trailing content on the line.
+_PAGE_MARKER_RE = re.compile(r"^[ \t]*##[ \t]+Page[ \t]+(\d+)\b.*$", re.IGNORECASE | re.MULTILINE)
+
+# --- PDF processing modes ---------------------------------------------------
+#: Mode actually USED for a document (recorded in metadata). Distinct from the
+#: config's requested mode, which may be ``auto``.
+MODE_WHOLE_PDF = "whole_pdf"
+MODE_PER_PAGE = "per_page"
+
+#: Finish-reason tokens (normalized to upper-case, non-alphanumerics stripped)
+#: that indicate the model's output was cut off by a length/token limit. Used as
+#: one of two truncation signals for auto-fallback. Membership-checked, so a
+#: stray/unset finish_reason (e.g. a bare MagicMock) never matches.
+_TRUNCATION_FINISH_REASONS = {"MAXTOKENS", "MAX_TOKENS", "LENGTH", "MODELLENGTH"}
+
+
+def _normalize_finish_reason(finish_reason: Any) -> str:
+    """Normalize a finish_reason (enum, str, or None) to an upper-case token."""
+    if finish_reason is None:
+        return ""
+    name = getattr(finish_reason, "name", None)
+    raw = name if isinstance(name, str) else str(finish_reason)
+    return re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+
+
+def is_truncated(finish_reason: Any, parsed_pages: int, actual_pages: int) -> bool:
+    """Return True if a whole-PDF response looks truncated.
+
+    Two signals, no hardcoded page-count threshold:
+
+    * **finish reason** — the model reports it stopped on a length/token limit
+      (``MAX_TOKENS`` / ``LENGTH``); or
+    * **page shortfall** — fewer ``## Page N`` markers were recovered than the PDF
+      actually has pages (``parsed_pages < actual_pages``), which means the tail
+      of the document was dropped.
+
+    ``actual_pages <= 0`` (page count unknown) disables the shortfall signal.
+    """
+    if _normalize_finish_reason(finish_reason) in _TRUNCATION_FINISH_REASONS:
+        return True
+    # Page shortfall: fewer recovered pages than the PDF actually has.
+    return actual_pages > 0 and parsed_pages < actual_pages
+
+
+def split_native_pages(markdown: str) -> list[str]:
+    """Split a native single-call markdown blob into per-page sections.
+
+    Splits on ``## Page N`` boundary headers (the marker line itself is dropped,
+    since the contract's :func:`assemble_pages` re-adds canonical headers). Any
+    text appearing before the first marker (preamble the model may emit) is
+    prepended to the first page so no content is lost.
+
+    Falls back to a single page (the whole blob) when no markers are present, so
+    the document is still emitted as valid contract output rather than discarded.
+    Returns an empty list only for empty/whitespace-only input.
+    """
+    text = (markdown or "").strip()
+    if not text:
+        return []
+
+    matches = list(_PAGE_MARKER_RE.finditer(markdown))
+    if not matches:
+        # Model ignored the marker instruction: keep everything as one page.
+        return [text]
+
+    pages: list[str] = []
+    preamble = markdown[: matches[0].start()].strip()
+    for i, m in enumerate(matches):
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+        body = markdown[body_start:body_end].strip()
+        if i == 0 and preamble:
+            body = (preamble + "\n\n" + body).strip() if body else preamble
+        pages.append(body)
+    return pages
+
 
 @dataclass
 class OCRResult:
-    """Result from processing a document."""
+    """Result from processing a document (one or more pages).
+
+    ``pages`` holds the per-page markdown text in order. ``success`` is True only
+    when every page succeeded; ``page_errors`` maps a 1-indexed page number to
+    its error string for any page that failed (a partial document has both some
+    text and some entries here).
+    """
 
     file_path: Path
-    text: str
+    pages: list[str]
     success: bool
     error: str | None = None
     processing_time: float = 0.0
+    page_errors: dict[int, str] = field(default_factory=dict)
     extracted_images: list[dict[str, Any]] = field(default_factory=list)
+    #: PDF mode actually used (``whole_pdf`` / ``per_page``); ``None`` for images.
+    mode: str | None = None
+    #: True when ``auto`` mode tried whole-PDF, detected truncation, and redid the
+    #: document page-by-page. Recorded in metadata so the fallback is non-silent.
+    fell_back_from_whole_pdf: bool = False
+
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
+
+    @property
+    def status(self) -> Status:
+        """Map the result to a contract status enum.
+
+        ``completed`` = every attempted page succeeded; ``partial`` = some pages
+        succeeded and some failed; ``failed`` = no page produced usable text
+        (every page failed, or the document could not be opened at all). Note
+        that failed page slots carry a placeholder marker, so we count genuine
+        successes via ``page_count - len(page_errors)`` rather than by scanning
+        the (placeholder-filled) page text.
+        """
+        if self.success and not self.page_errors:
+            return Status.COMPLETED
+        succeeded = self.page_count - len(self.page_errors)
+        if succeeded > 0:
+            return Status.PARTIAL
+        return Status.FAILED
+
+    @property
+    def text(self) -> str:
+        """Backwards-compatible flat text view (pages joined with blank lines)."""
+        return "\n\n".join(p for p in self.pages if p)
 
 
 class OCRProcessor:
-    """OCR processor using Google Gemini API with native PDF support."""
+    """OCR processor using Google Gemini API, processing PDFs page by page."""
 
     def __init__(self, config: Config):
         """Initialize the OCR processor."""
@@ -116,12 +296,16 @@ class OCRProcessor:
         return types.GenerateContentConfig(**kwargs)
 
     @staticmethod
-    def _extract_text(response: Any) -> str:
-        """Extract text from a GenerateContentResponse by walking parts explicitly.
+    def _extract_text(response: Any) -> tuple[str, Any]:
+        """Extract ``(text, finish_reason)`` from a GenerateContentResponse.
 
-        The `.text` shortcut returns None when parts include thought summaries,
-        non-text parts, or when finish_reason != STOP — which is common with
-        Gemini 3.x thinking models. Walking parts is the reliable path.
+        Walks ``candidates[0].content.parts`` explicitly: the ``.text`` shortcut
+        returns None when parts include thought summaries, non-text parts, or when
+        finish_reason != STOP, which is common with Gemini 3.x thinking models.
+
+        The ``finish_reason`` is returned alongside the text so callers can detect
+        length-limited truncation (used by native-mode auto-fallback). Raises
+        ``RuntimeError`` on an empty extraction.
         """
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
@@ -129,6 +313,7 @@ class OCRProcessor:
             raise RuntimeError(f"Empty response: no candidates (prompt_feedback={feedback})")
 
         candidate = candidates[0]
+        finish = getattr(candidate, "finish_reason", None)
         content = getattr(candidate, "content", None)
         parts = getattr(content, "parts", None) or []
         text = "".join(
@@ -136,7 +321,6 @@ class OCRProcessor:
         ).strip()
 
         if not text:
-            finish = getattr(candidate, "finish_reason", None)
             safety = getattr(candidate, "safety_ratings", None)
             part_types = [type(p).__name__ for p in parts]
             raise RuntimeError(
@@ -144,10 +328,10 @@ class OCRProcessor:
                 f"len(parts)={len(parts)}, part_types={part_types}, "
                 f"safety_ratings={safety}"
             )
-        return text
+        return text, finish
 
-    def _call_with_retry(self, contents: list[Any], prompt: str) -> str:
-        """Call generate_content with exponential backoff on transient errors."""
+    def _call_with_retry_detailed(self, contents: list[Any], prompt: str) -> tuple[str, Any]:
+        """Call generate_content with backoff; return ``(text, finish_reason)``."""
         max_attempts = self.config.max_retries + 1
         base_delay = self.config.retry_base_delay
         config = self._build_generation_config()
@@ -175,8 +359,13 @@ class OCRProcessor:
                 time.sleep(delay)
         raise RuntimeError("Retry loop exited unexpectedly")
 
+    def _call_with_retry(self, contents: list[Any], prompt: str) -> str:
+        """Call generate_content with backoff; return just the extracted text."""
+        text, _finish = self._call_with_retry_detailed(contents, prompt)
+        return text
+
     def _upload_file(self, file_path: Path) -> Any:
-        """Upload file to Gemini Files API."""
+        """Upload a file to the Gemini Files API (native whole-PDF mode)."""
         if self.config.verbose:
             console.print(f"[dim]Uploading {file_path.name}...[/dim]")
 
@@ -203,25 +392,34 @@ class OCRProcessor:
         buffer.seek(0)
         return types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/jpeg")
 
+    def _ocr_image(
+        self,
+        image: Image.Image,
+        task: str,
+        custom_prompt: str | None,
+    ) -> str:
+        """Run OCR on a single in-memory image and return its markdown text."""
+        prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
+        image_part = self._pil_to_part(image)
+        return self._call_with_retry([image_part], prompt)
+
     def process_image(
         self,
         image_path: Path,
         task: str = "convert",
         custom_prompt: str | None = None,
     ) -> OCRResult:
-        """Process a single image file."""
+        """Process a single image file as a one-page document."""
         start_time = time.time()
         try:
             self.config.validate_file_size(image_path)
             image = Image.open(image_path)
             if image.mode != "RGB":
                 image = image.convert("RGB")
-            prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-            image_part = self._pil_to_part(image)
-            text = self._call_with_retry([image_part], prompt)
+            text = self._ocr_image(image, task, custom_prompt)
             return OCRResult(
                 file_path=image_path,
-                text=text,
+                pages=[text],
                 success=True,
                 processing_time=time.time() - start_time,
             )
@@ -229,10 +427,11 @@ class OCRProcessor:
             logger.error(f"Error processing {image_path}: {e}")
             return OCRResult(
                 file_path=image_path,
-                text="",
+                pages=[],
                 success=False,
                 error=str(e),
                 processing_time=time.time() - start_time,
+                page_errors={1: str(e)},
             )
 
     def process_pdf(
@@ -241,10 +440,82 @@ class OCRProcessor:
         task: str = "convert",
         custom_prompt: str | None = None,
         show_progress: bool = True,
+        mode: str | None = None,
+        per_page: bool | None = None,
     ) -> OCRResult:
-        """Process a PDF file using native Gemini PDF support."""
+        """Process a PDF in one of three modes (auto / whole_pdf / per_page).
+
+        ``mode`` selects the path; when ``None`` it falls back to
+        ``self.config.pdf_mode`` (default ``"auto"``). For backwards/test
+        convenience ``per_page=True`` forces ``per_page`` and ``per_page=False``
+        forces ``whole_pdf`` (overriding ``mode``).
+
+        * ``auto`` — whole-PDF (one call); if the response is truncated (see
+          :func:`is_truncated`) the document is automatically re-processed
+          page-by-page and that result is used, with the fallback recorded in
+          metadata (non-silent).
+        * ``whole_pdf`` — whole-PDF, no fallback (caller accepts truncation risk).
+        * ``per_page`` — page-by-page always.
+        """
+        if per_page is True:
+            effective = MODE_PER_PAGE
+        elif per_page is False:
+            effective = MODE_WHOLE_PDF
+        else:
+            effective = mode if mode is not None else self.config.pdf_mode
+
+        if effective == MODE_PER_PAGE:
+            return self._process_pdf_per_page(
+                pdf_path, task=task, custom_prompt=custom_prompt, show_progress=show_progress
+            )
+        # whole_pdf and auto both start with a single whole-PDF call.
+        allow_fallback = effective != MODE_WHOLE_PDF
+        return self._process_pdf_native(
+            pdf_path,
+            task=task,
+            custom_prompt=custom_prompt,
+            show_progress=show_progress,
+            allow_fallback=allow_fallback,
+        )
+
+    def _process_pdf_native(
+        self,
+        pdf_path: Path,
+        task: str = "convert",
+        custom_prompt: str | None = None,
+        show_progress: bool = True,
+        allow_fallback: bool = False,
+    ) -> OCRResult:
+        """Process a PDF natively: one upload + one Gemini call for the document.
+
+        The whole PDF is uploaded via the Files API and OCR'd in a single call.
+        The prompt asks the model to begin each page with a ``## Page N`` header;
+        the returned markdown is split on those markers (see
+        :func:`split_native_pages`) to recover per-page text for the contract.
+
+        When ``allow_fallback`` is True (the ``auto`` default) and the response is
+        truncated (length-limited finish reason, or fewer recovered pages than the
+        PDF actually has), the document is automatically re-processed page-by-page
+        and that result is returned instead, flagged ``fell_back_from_whole_pdf``.
+
+        Failure policy (canon SYS-02): if the call errors or returns empty text,
+        the result is ``FAILED`` (no pages, ``status=failed`` recorded). When the
+        single-call response carries no ``## Page N`` markers the whole blob is
+        kept as one page so content is never silently dropped.
+        """
         start_time = time.time()
         self.config.validate_file_size(pdf_path)
+
+        # Actual page count is a truncation signal (recovered pages < real pages).
+        actual_pages = 0
+        try:
+            actual_pages = get_pdf_page_count(pdf_path)
+        except Exception as e:
+            logger.debug(f"Could not read page count for {pdf_path.name}: {e}")
+
+        # Native prompt: a custom prompt is honored verbatim; otherwise use the
+        # page-marker-augmented task prompt so a single call yields page markers.
+        prompt = custom_prompt or OCR_PROMPTS_NATIVE.get(task, OCR_PROMPTS_NATIVE["convert"])
 
         uploaded_file = None
         try:
@@ -258,14 +529,45 @@ class OCRProcessor:
                     progress.add_task("Uploading PDF...", total=None)
                     uploaded_file = self._upload_file(pdf_path)
                     progress.update(progress.task_ids[0], description="Processing...")
-                    prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-                    text = self._call_with_retry([uploaded_file], prompt)
+                    text, finish_reason = self._call_with_retry_detailed([uploaded_file], prompt)
             else:
                 uploaded_file = self._upload_file(pdf_path)
-                prompt = custom_prompt or OCR_PROMPTS.get(task, OCR_PROMPTS["convert"])
-                text = self._call_with_retry([uploaded_file], prompt)
+                text, finish_reason = self._call_with_retry_detailed([uploaded_file], prompt)
 
-            extracted_images = []
+            pages = split_native_pages(text)
+            if not pages:
+                # Empty document output is a failure per the contract.
+                return OCRResult(
+                    file_path=pdf_path,
+                    pages=[],
+                    success=False,
+                    error="Empty response from Gemini (no text returned)",
+                    processing_time=time.time() - start_time,
+                    mode=MODE_WHOLE_PDF,
+                )
+
+            # Auto-fallback: a truncated whole-PDF response means the tail of the
+            # document was dropped. Redo the doc page-by-page and use that result.
+            if allow_fallback and is_truncated(finish_reason, len(pages), actual_pages):
+                reason = (
+                    "length-limited finish reason"
+                    if _normalize_finish_reason(finish_reason) in _TRUNCATION_FINISH_REASONS
+                    else f"recovered {len(pages)} of {actual_pages} page(s)"
+                )
+                if not self.config.quiet:
+                    console.print(
+                        f"[yellow]Whole-PDF output truncated ({reason}); "
+                        f"falling back to per-page for {pdf_path.name}[/yellow]"
+                    )
+                logger.info("Auto-fallback to per-page for %s (%s)", pdf_path.name, reason)
+                fallback = self._process_pdf_per_page(
+                    pdf_path, task=task, custom_prompt=custom_prompt, show_progress=show_progress
+                )
+                fallback.fell_back_from_whole_pdf = True
+                fallback.processing_time = time.time() - start_time
+                return fallback
+
+            extracted_images: list[dict[str, Any]] = []
             if self.config.include_images:
                 try:
                     extracted_images = extract_pdf_images(pdf_path)
@@ -274,27 +576,125 @@ class OCRProcessor:
 
             return OCRResult(
                 file_path=pdf_path,
-                text=text,
+                pages=pages,
                 success=True,
                 processing_time=time.time() - start_time,
                 extracted_images=extracted_images,
+                mode=MODE_WHOLE_PDF,
             )
         except Exception as e:
             logger.error(f"Error processing {pdf_path}: {e}")
             return OCRResult(
                 file_path=pdf_path,
-                text="",
+                pages=[],
                 success=False,
                 error=str(e),
                 processing_time=time.time() - start_time,
+                mode=MODE_WHOLE_PDF,
             )
         finally:
-            # Clean up uploaded file from Gemini Files API (48hr retention)
+            # Clean up the uploaded file from the Files API (48h retention).
             if uploaded_file is not None:
                 try:
                     self.client.files.delete(name=uploaded_file.name)
                 except Exception as del_err:
                     logger.debug(f"Failed to delete uploaded file: {del_err}")
+
+    def _process_pdf_per_page(
+        self,
+        pdf_path: Path,
+        task: str = "convert",
+        custom_prompt: str | None = None,
+        show_progress: bool = True,
+    ) -> OCRResult:
+        """Process a PDF page by page, rendering each page and OCR'ing it.
+
+        Each page is an independent Gemini call so page boundaries and per-page
+        failures are real. A page that fails is recorded in ``page_errors`` and
+        emits an explicit failure marker in its slot, so the page count and
+        ``## Page N`` numbering stay aligned with the source PDF.
+        """
+        start_time = time.time()
+        self.config.validate_file_size(pdf_path)
+
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            logger.error(f"Error opening {pdf_path}: {e}")
+            return OCRResult(
+                file_path=pdf_path,
+                pages=[],
+                success=False,
+                error=str(e),
+                processing_time=time.time() - start_time,
+                mode=MODE_PER_PAGE,
+            )
+
+        try:
+            num_pages = len(doc)
+            pages: list[str] = []
+            page_errors: dict[int, str] = {}
+            zoom = PDF_RENDER_DPI / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+
+            progress_ctx = (
+                Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                    console=console,
+                    transient=True,
+                )
+                if (show_progress and not self.config.quiet)
+                else None
+            )
+
+            def run() -> None:
+                task_id = None
+                if progress_ctx is not None:
+                    task_id = progress_ctx.add_task(f"OCR {pdf_path.name}", total=num_pages)
+                for page_idx in range(num_pages):
+                    page_no = page_idx + 1
+                    try:
+                        pix = doc[page_idx].get_pixmap(matrix=matrix)
+                        image = Image.open(io.BytesIO(pix.tobytes("png")))
+                        text = self._ocr_image(image, task, custom_prompt)
+                        pages.append(text)
+                    except Exception as page_err:
+                        logger.error(f"Page {page_no} of {pdf_path.name} failed: {page_err}")
+                        page_errors[page_no] = str(page_err)
+                        pages.append(f"*[OCR failed for page {page_no}]*")
+                    if progress_ctx is not None and task_id is not None:
+                        progress_ctx.advance(task_id)
+
+            if progress_ctx is not None:
+                with progress_ctx:
+                    run()
+            else:
+                run()
+
+            extracted_images: list[dict[str, Any]] = []
+            if self.config.include_images:
+                try:
+                    extracted_images = extract_pdf_images(pdf_path)
+                except Exception as e:
+                    logger.warning(f"Failed to extract embedded images: {e}")
+
+            success = not page_errors
+            error = None if success else f"{len(page_errors)} of {num_pages} page(s) failed"
+            return OCRResult(
+                file_path=pdf_path,
+                pages=pages,
+                success=success,
+                error=error,
+                processing_time=time.time() - start_time,
+                page_errors=page_errors,
+                extracted_images=extracted_images,
+                mode=MODE_PER_PAGE,
+            )
+        finally:
+            doc.close()
 
     def process_file(
         self,
@@ -302,55 +702,146 @@ class OCRProcessor:
         task: str = "convert",
         custom_prompt: str | None = None,
         show_progress: bool = True,
+        per_page: bool | None = None,
     ) -> OCRResult:
-        """Process a single file (image or PDF)."""
+        """Process a single file (image or PDF).
+
+        ``per_page`` selects the PDF processing mode (``None`` = config default).
+        It is ignored for single images (always a one-call, one-page document).
+        """
         if is_pdf_file(file_path):
             return self.process_pdf(
-                file_path, task=task, custom_prompt=custom_prompt, show_progress=show_progress
+                file_path,
+                task=task,
+                custom_prompt=custom_prompt,
+                show_progress=show_progress,
+                per_page=per_page,
             )
         elif is_image_file(file_path):
             return self.process_image(file_path, task=task, custom_prompt=custom_prompt)
         else:
             raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
-    def save_results(self, result: OCRResult, output_dir: Path) -> Path:
-        """Save OCR results to per-document folder.
+    # ------------------------------------------------------------------
+    # Output writing (all routed through the contract module)
+    # ------------------------------------------------------------------
 
-        Output structure:
-            output_dir/doc_name/doc_name.md
-            output_dir/doc_name/figures/page1_img1.png
+    def save_results(
+        self,
+        result: OCRResult,
+        output_root: Path,
+        rel_key: str,
+    ) -> Path:
+        """Write the aggregated markdown + figures for one document.
+
+        The layout is determined entirely by the contract module:
+        ``<output_root>/<rel/dir>/<stem>/<stem>.md`` plus a ``figures/`` folder.
+        Figures are normalised to PNG and named ``figure_<N>_page<P>.png`` with
+        resolving links appended to the markdown.
         """
-        base_name = sanitize_filename(result.file_path.stem)
-        doc_dir = output_dir / base_name
+        doc_dir = doc_dir_for(output_root, rel_key)
         doc_dir.mkdir(parents=True, exist_ok=True)
-        markdown_path = doc_dir / f"{base_name}.md"
+        markdown_path = markdown_path_for(doc_dir, rel_key)
 
-        # Save original image if configured
-        if self.config.save_original_images and is_image_file(result.file_path):
-            original_output = doc_dir / f"{base_name}{result.file_path.suffix}"
-            shutil.copy2(result.file_path, original_output)
-
-        # Write clean markdown — just the OCR text, no headers
-        if result.success:
-            markdown_path.write_text(result.text, encoding="utf-8")
+        # Build the clean markdown body: pages under ## Page N, no frontmatter.
+        if result.pages:
+            body = assemble_pages(result.pages)
         else:
-            # Sanitize error: don't leak raw exception details to output files
-            markdown_path.write_text("*[OCR Failed]*", encoding="utf-8")
+            body = "*[OCR Failed]*\n"
 
-        # Save extracted images
-        if result.extracted_images and self.config.include_images:
-            figures_dir = doc_dir / "figures"
-            figures_dir.mkdir(parents=True, exist_ok=True)
-            for img_info in result.extracted_images:
-                img_filename = f"page{img_info['page']}_img{img_info['index']}.{img_info['ext']}"
-                img_path = figures_dir / img_filename
-                with open(img_path, "wb") as f:
-                    f.write(img_info["data"])
+        # Save & link extracted figures (normalised to PNG).
+        figure_links = self._save_figures(result, doc_dir)
+        if figure_links:
+            body = body.rstrip("\n") + "\n\n## Figures\n\n" + "\n\n".join(figure_links) + "\n"
+
+        markdown_path.write_text(body, encoding="utf-8")
 
         if self.config.verbose:
             console.print(f"[green]Saved:[/green] {markdown_path}")
 
         return markdown_path
+
+    def _save_figures(self, result: OCRResult, doc_dir: Path) -> list[str]:
+        """Persist extracted images as PNG and return resolving markdown links."""
+        if not (result.extracted_images and self.config.include_images):
+            return []
+
+        figures_dir = figures_dir_for(doc_dir)
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        links: list[str] = []
+        figure_counter = 0
+        for img_info in result.extracted_images:
+            figure_counter += 1
+            page_no = int(img_info.get("page", 1))
+            filename = figure_filename(figure_counter, page_no)
+            img_path = figures_dir / filename
+            try:
+                image = Image.open(io.BytesIO(img_info["data"]))
+                if image.mode not in ("RGB", "RGBA"):
+                    image = image.convert("RGB")
+                image.save(img_path, format="PNG")
+                links.append(figure_markdown_link(figure_counter, page_no))
+            except Exception as e:
+                logger.warning(f"Failed to save figure {figure_counter} (page {page_no}): {e}")
+                figure_counter -= 1
+        return links
+
+    def _build_doc_metadata(
+        self,
+        result: OCRResult,
+        file_path: Path,
+        markdown_path: Path,
+        output_root: Path,
+    ) -> DocMetadata:
+        """Assemble the per-document metadata record from a result."""
+        status = result.status
+        error = None
+        if status is not Status.COMPLETED:
+            if result.page_errors:
+                error = "; ".join(
+                    f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items())
+                )
+            elif result.error:
+                error = result.error
+        return DocMetadata(
+            status=status,
+            checksum=sha256_checksum(file_path),
+            model=self.model_name,
+            backend=BACKEND,
+            processing_time=result.processing_time,
+            timestamp=utc_timestamp(),
+            output_path=str(markdown_path.relative_to(output_root)),
+            pages=result.page_count,
+            error=error,
+            mode=result.mode,
+            fell_back_from_whole_pdf=result.fell_back_from_whole_pdf,
+        )
+
+    def _persist(
+        self,
+        result: OCRResult,
+        file_path: Path,
+        output_root: Path,
+        rel_key: str,
+        index: RootIndex,
+    ) -> tuple[DocMetadata, Path]:
+        """Write markdown, figures, and BOTH metadata levels for one document.
+
+        Always writes output (markdown + per-doc + root metadata) regardless of
+        success, so failures are recorded with ``status=failed`` per the canon.
+        Returns ``(metadata, markdown_path)`` (caller maps status to outcome).
+        """
+        markdown_path = self.save_results(result, output_root, rel_key)
+        meta = self._build_doc_metadata(result, file_path, markdown_path, output_root)
+        doc_dir = doc_dir_for(output_root, rel_key)
+        write_doc_metadata(doc_dir, rel_key, meta)
+        with self._lock:
+            index.record(rel_key, meta)
+        return meta, markdown_path
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
 
     def process(
         self,
@@ -359,12 +850,18 @@ class OCRProcessor:
         task: str = "convert",
         custom_prompt: str | None = None,
         reprocess: bool = False,
-    ) -> None:
-        """Process input path (file or directory)."""
+    ) -> RunOutcome:
+        """Process input path (file or directory). Returns a RunOutcome.
+
+        The returned :class:`RunOutcome` carries the uniform exit policy: nonzero
+        if any file or page failed, across both single-file and batch runs.
+        """
         if input_path.is_file():
-            self._process_single_file(input_path, output_path, task, custom_prompt, reprocess)
+            return self._process_single_file(
+                input_path, output_path, task, custom_prompt, reprocess
+            )
         elif input_path.is_dir():
-            self._process_directory(input_path, output_path, task, custom_prompt, reprocess)
+            return self._process_directory(input_path, output_path, task, custom_prompt, reprocess)
         else:
             raise ValueError(f"Input path does not exist: {input_path}")
 
@@ -375,33 +872,38 @@ class OCRProcessor:
         task: str,
         custom_prompt: str | None,
         reprocess: bool,
-    ) -> None:
-        """Process a single file."""
-        output_dir = determine_output_path(file_path, output_path)
-        meta = MetadataManager(output_dir)
+    ) -> RunOutcome:
+        """Process a single file. Scan root is the file's parent (rel key = name)."""
+        outcome = RunOutcome()
+        output_root = resolve_output_root(file_path, output_path)
+        output_root.mkdir(parents=True, exist_ok=True)
+        scan_root = file_path.parent
+        rel_key = relative_key(file_path, scan_root)
+        index = RootIndex(output_root)
 
-        if meta.is_processed(file_path) and not reprocess:
+        if not reprocess and index.is_completed(rel_key, sha256_checksum(file_path)):
             console.print(f"[yellow]Already processed:[/yellow] {file_path.name}")
             console.print("[dim]Use --reprocess to force reprocessing[/dim]")
-            return
+            outcome.add(Status.COMPLETED)
+            return outcome
 
         console.print(f"[blue]Processing:[/blue] {file_path}")
-        console.print(f"[blue]Output:[/blue] {output_dir}\n")
+        console.print(f"[blue]Output:[/blue] {output_root}\n")
 
         result = self.process_file(file_path, task=task, custom_prompt=custom_prompt)
+        meta, markdown_path = self._persist(result, file_path, output_root, rel_key, index)
+        outcome.add(
+            meta.status,
+            detail=None if meta.status is Status.COMPLETED else rel_key,
+            output_path=str(markdown_path),
+        )
 
-        if result.success:
-            output_file = self.save_results(result, output_dir)
-            meta.record(
-                file_path,
-                processing_time=result.processing_time,
-                model=self.model_name,
-                output_path=str(output_file.relative_to(output_dir)),
-            )
+        if meta.status is Status.COMPLETED:
             console.print("\n[green]Success[/green]")
             console.print(f"[dim]Time: {result.processing_time:.2f}s[/dim]")
         else:
-            console.print(f"\n[red]Failed to process file: {result.error}[/red]")
+            console.print(f"\n[red]Failed ({meta.status.value}):[/red] {meta.error}")
+        return outcome
 
     def _process_directory(
         self,
@@ -410,76 +912,83 @@ class OCRProcessor:
         task: str,
         custom_prompt: str | None,
         reprocess: bool,
-    ) -> None:
-        """Process all files in a directory."""
+    ) -> RunOutcome:
+        """Process all files in a directory, keyed on input-relative paths."""
+        outcome = RunOutcome()
         files = get_supported_files(dir_path)
         if not files:
             console.print("[yellow]No supported files found[/yellow]")
-            return
+            return outcome
 
-        output_dir = determine_output_path(dir_path, output_path)
-        meta = MetadataManager(output_dir)
+        output_root = resolve_output_root(dir_path, output_path)
+        output_root.mkdir(parents=True, exist_ok=True)
+        index = RootIndex(output_root)
 
-        # Filter files
-        files_to_process = []
+        # Filter already-processed files (keyed by input-relative path).
+        files_to_process: list[tuple[Path, str]] = []
         for f in files:
-            if meta.is_processed(f) and not reprocess:
+            rel_key = relative_key(f, dir_path)
+            if not reprocess and index.is_completed(rel_key, sha256_checksum(f)):
                 if self.config.verbose:
-                    console.print(f"[dim]Skipping: {f.name}[/dim]")
+                    console.print(f"[dim]Skipping: {rel_key}[/dim]")
+                outcome.add(Status.COMPLETED)
             else:
-                files_to_process.append(f)
+                files_to_process.append((f, rel_key))
 
         if not files_to_process:
             console.print("[green]All files already processed[/green]")
             console.print("[dim]Use --reprocess to force reprocessing[/dim]")
-            return
+            return outcome
 
         console.print(f"[blue]Processing {len(files_to_process)} file(s)...[/blue]")
-        console.print(f"[blue]Output:[/blue] {output_dir}\n")
+        console.print(f"[blue]Output:[/blue] {output_root}\n")
 
         start_time = time.time()
-        success_count = 0
 
         if self.config.max_workers > 1:
-            success_count = self._process_directory_concurrent(
-                files_to_process, output_dir, meta, task, custom_prompt
+            self._process_directory_concurrent(
+                files_to_process, output_root, index, task, custom_prompt, outcome
             )
         else:
-            for file_path in files_to_process:
+            for file_path, rel_key in files_to_process:
                 file_size = format_file_size(file_path.stat().st_size)
-                console.print(f"[cyan]{file_path.name}[/cyan] ({file_size})")
-
-                result = self.process_file(file_path, task=task, custom_prompt=custom_prompt)
-
-                if result.success:
-                    output_file = self.save_results(result, output_dir)
-                    with self._lock:
-                        meta.record(
-                            file_path,
-                            processing_time=result.processing_time,
-                            model=self.model_name,
-                            output_path=str(output_file.relative_to(output_dir)),
-                        )
-                    success_count += 1
+                console.print(f"[cyan]{rel_key}[/cyan] ({file_size})")
+                result = self.process_file(
+                    file_path, task=task, custom_prompt=custom_prompt, show_progress=False
+                )
+                meta, markdown_path = self._persist(result, file_path, output_root, rel_key, index)
+                outcome.add(
+                    meta.status,
+                    detail=None if meta.status is Status.COMPLETED else rel_key,
+                    output_path=str(markdown_path),
+                )
+                if meta.status is Status.COMPLETED:
                     console.print(f"  [green]OK[/green] ({result.processing_time:.1f}s)\n")
                 else:
-                    console.print(f"  [red]FAILED: {result.error}[/red]\n")
+                    console.print(f"  [red]{meta.status.value.upper()}: {meta.error}[/red]\n")
 
         total_time = time.time() - start_time
-        console.print(f"\n[green]Completed:[/green] {success_count}/{len(files_to_process)} files")
+        console.print(
+            f"\n[green]Completed:[/green] {outcome.completed}/"
+            f"{outcome.completed + outcome.failed + outcome.partial} files"
+        )
+        if outcome.has_failures:
+            console.print(
+                f"[red]Failures:[/red] {outcome.failed} failed, {outcome.partial} partial"
+            )
         console.print(f"[dim]Total time: {total_time:.2f}s[/dim]")
+        return outcome
 
     def _process_directory_concurrent(
         self,
-        files: list[Path],
-        output_dir: Path,
-        meta: MetadataManager,
+        files: list[tuple[Path, str]],
+        output_root: Path,
+        index: RootIndex,
         task: str,
         custom_prompt: str | None,
-    ) -> int:
+        outcome: RunOutcome,
+    ) -> None:
         """Process files concurrently with a thread pool."""
-        success_count = 0
-
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -492,33 +1001,34 @@ class OCRProcessor:
             progress_task = progress.add_task("Processing...", total=len(files))
 
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-                future_to_path = {
-                    executor.submit(self.process_file, f, task, custom_prompt, False): f
-                    for f in files
+                future_to_meta = {
+                    executor.submit(self.process_file, f, task, custom_prompt, False): (f, rel_key)
+                    for f, rel_key in files
                 }
 
-                for future in as_completed(future_to_path):
-                    file_path = future_to_path[future]
+                for future in as_completed(future_to_meta):
+                    file_path, rel_key = future_to_meta[future]
                     try:
                         result = future.result()
-                        if result.success:
-                            output_file = self.save_results(result, output_dir)
-                            with self._lock:
-                                meta.record(
-                                    file_path,
-                                    processing_time=result.processing_time,
-                                    model=self.model_name,
-                                    output_path=str(output_file.relative_to(output_dir)),
-                                )
-                            success_count += 1
+                        meta, markdown_path = self._persist(
+                            result, file_path, output_root, rel_key, index
+                        )
+                        outcome.add(
+                            meta.status,
+                            detail=None if meta.status is Status.COMPLETED else rel_key,
+                            output_path=str(markdown_path),
+                        )
+                        if meta.status is Status.COMPLETED:
                             console.print(
-                                f"  [green]OK[/green] {file_path.name} ({result.processing_time:.1f}s)"
+                                f"  [green]OK[/green] {rel_key} ({result.processing_time:.1f}s)"
                             )
                         else:
-                            console.print(f"  [red]FAILED[/red] {file_path.name}: {result.error}")
+                            console.print(
+                                f"  [red]{meta.status.value.upper()}[/red] {rel_key}: {meta.error}"
+                            )
                     except Exception as e:
-                        console.print(f"  [red]ERROR[/red] {file_path.name}: {e}")
+                        # Catastrophic failure (could not even build a result).
+                        console.print(f"  [red]ERROR[/red] {rel_key}: {e}")
+                        outcome.add(Status.FAILED, detail=rel_key)
 
                     progress.advance(progress_task)
-
-        return success_count

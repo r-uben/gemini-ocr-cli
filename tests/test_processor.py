@@ -17,16 +17,18 @@ class TestOCRResult:
     def test_success_true(self):
         result = OCRResult(
             file_path=Path("test.pdf"),
-            text="Extracted content",
+            pages=["Extracted content"],
             success=True,
             processing_time=1.0,
         )
         assert result.success is True
+        assert result.text == "Extracted content"
+        assert result.page_count == 1
 
     def test_success_false(self):
         result = OCRResult(
             file_path=Path("test.pdf"),
-            text="",
+            pages=[],
             success=False,
             error="Processing failed",
             processing_time=1.0,
@@ -55,8 +57,9 @@ class TestOCRProcessor:
 
     def test_init_raises_without_api_key(self):
         with patch.dict(os.environ, {}, clear=True):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+            env = {
+                k: v for k, v in os.environ.items() if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+            }
             with patch.dict(os.environ, env, clear=True):
                 config = Config()
                 config.api_key = ""
@@ -80,7 +83,7 @@ class TestOCRProcessor:
     def test_process_file_detects_image(self, processor, sample_image):
         with patch.object(processor, "process_image") as mock_process:
             mock_process.return_value = OCRResult(
-                file_path=sample_image, text="content", success=True, processing_time=0.1
+                file_path=sample_image, pages=["content"], success=True, processing_time=0.1
             )
             processor.process_file(sample_image)
             mock_process.assert_called_once()
@@ -88,7 +91,7 @@ class TestOCRProcessor:
     def test_process_file_detects_pdf(self, processor, sample_pdf):
         with patch.object(processor, "process_pdf") as mock_process:
             mock_process.return_value = OCRResult(
-                file_path=sample_pdf, text="content", success=True, processing_time=0.1
+                file_path=sample_pdf, pages=["content"], success=True, processing_time=0.1
             )
             processor.process_file(sample_pdf)
             mock_process.assert_called_once()
@@ -109,8 +112,8 @@ class TestOCRProcessor:
         assert not OCRProcessor._is_retryable(ValueError("invalid input"))
 
 
-class TestOCRProcessorUpload:
-    """Tests for file upload functionality."""
+class TestOCRProcessorNative:
+    """Tests for native whole-PDF processing (the DEFAULT 'auto' path)."""
 
     @pytest.fixture
     def processor(self, mock_config, mock_genai_client):
@@ -120,29 +123,258 @@ class TestOCRProcessorUpload:
             processor.client = mock_genai_client
             return processor
 
-    def test_upload_file(self, processor, sample_pdf):
-        processor.client.files.upload.return_value.state = "ACTIVE"
-        uploaded = processor._upload_file(sample_pdf)
-        processor.client.files.upload.assert_called_once()
-        assert uploaded is not None
+    def test_native_is_default_single_call(self, processor, sample_pdf):
+        # Default mode is "auto": whole-PDF = ONE Gemini call. A complete response
+        # (one marker per actual page) must NOT trigger fallback => exactly 1 call.
+        from tests.conftest import make_gemini_response
 
-    def test_upload_file_waits_for_processing(self, processor, sample_pdf):
-        mock_file = MagicMock()
-        mock_file.state = "PROCESSING"
-        processor.client.files.upload.return_value = mock_file
-        active_file = MagicMock()
-        active_file.state = "ACTIVE"
-        processor.client.files.get.return_value = active_file
-        processor._upload_file(sample_pdf)
-        processor.client.files.get.assert_called()
+        processor.client.models.generate_content.return_value = make_gemini_response(
+            "## Page 1\n\nFirst page text.\n\n## Page 2\n\nSecond page text."
+        )
+        result = processor.process_pdf(sample_pdf, show_progress=False)
+        assert result.success
+        assert result.mode == "whole_pdf"
+        assert result.fell_back_from_whole_pdf is False
+        assert processor.client.models.generate_content.call_count == 1
+        # Uploaded once via the Files API, then deleted (no leak).
+        assert processor.client.files.upload.call_count == 1
+        assert processor.client.files.delete.call_count == 1
 
-    def test_upload_file_raises_on_failure(self, processor, sample_pdf):
-        mock_file = MagicMock()
-        mock_file.state = "FAILED"
-        mock_file.name = "test-file"
-        processor.client.files.upload.return_value = mock_file
-        with pytest.raises(RuntimeError, match="File upload failed"):
-            processor._upload_file(sample_pdf)
+    def test_native_splits_response_on_page_markers(self, processor, sample_pdf):
+        from tests.conftest import make_gemini_response
+
+        processor.client.models.generate_content.return_value = make_gemini_response(
+            "## Page 1\n\nAlpha content.\n\n## Page 2\n\nBeta content."
+        )
+        result = processor.process_pdf(sample_pdf, show_progress=False)
+        assert result.success
+        assert result.page_count == 2
+        assert "Alpha content." in result.pages[0]
+        assert "Beta content." in result.pages[1]
+        # Marker lines are dropped (contract re-adds canonical headers).
+        assert "## Page" not in result.pages[0]
+
+    def test_whole_pdf_no_markers_falls_back_to_single_page(self, processor, sample_pdf):
+        # In forced whole_pdf mode (no fallback), an unsplittable blob is kept as
+        # one page rather than discarded.
+        from tests.conftest import make_gemini_response
+
+        processor.client.models.generate_content.return_value = make_gemini_response(
+            "Just one undivided blob with no page markers."
+        )
+        result = processor.process_pdf(sample_pdf, show_progress=False, mode="whole_pdf")
+        assert result.success
+        assert result.page_count == 1
+        assert result.mode == "whole_pdf"
+        assert "undivided blob" in result.pages[0]
+        # No fallback in forced whole_pdf mode: a single whole-PDF call only.
+        assert processor.client.models.generate_content.call_count == 1
+
+    def test_native_empty_response_is_failure(self, processor, sample_pdf):
+        # An empty extraction raises in _extract_text -> caught -> FAILED.
+        processor.client.models.generate_content.side_effect = RuntimeError(
+            "Empty response: finish_reason=STOP"
+        )
+        result = processor.process_pdf(sample_pdf, show_progress=False, mode="whole_pdf")
+        assert not result.success
+        assert result.page_count == 0
+        assert result.status.value == "failed"
+        assert result.mode == "whole_pdf"
+
+    def test_uses_per_page_when_config_mode_set(self, mock_config, mock_genai_client, sample_pdf):
+        # config.pdf_mode="per_page" must route process_pdf to the per-page path.
+        mock_config.pdf_mode = "per_page"
+        with patch("gemini_ocr.processor.genai") as mock_genai:
+            mock_genai.Client.return_value = mock_genai_client
+            processor = OCRProcessor(mock_config)
+            processor.client = mock_genai_client
+        result = processor.process_pdf(sample_pdf, show_progress=False)
+        # Per-page on the 2-page sample => 2 calls, no Files-API upload.
+        assert result.page_count == 2
+        assert result.mode == "per_page"
+        assert processor.client.models.generate_content.call_count == 2
+        assert processor.client.files.upload.call_count == 0
+
+
+class TestOCRProcessorAutoFallback:
+    """Tests for auto-mode truncation detection + per-page fallback."""
+
+    @pytest.fixture
+    def processor(self, mock_config, mock_genai_client):
+        with patch("gemini_ocr.processor.genai") as mock_genai:
+            mock_genai.Client.return_value = mock_genai_client
+            processor = OCRProcessor(mock_config)
+            processor.client = mock_genai_client
+            return processor
+
+    def test_fallback_on_max_tokens_finish_reason(self, processor, sample_pdf):
+        # Whole-PDF returns a length-limited finish reason -> auto-fallback.
+        from tests.conftest import make_gemini_response
+
+        first = {"done": False}
+
+        def gen(*args, **kwargs):
+            if not first["done"]:
+                first["done"] = True
+                # Whole-PDF call: a complete-looking 2-page blob, but cut off.
+                resp = make_gemini_response("## Page 1\n\nA\n\n## Page 2\n\nB (truncated")
+                resp.candidates[0].finish_reason = "MAX_TOKENS"
+                return resp
+            # Subsequent per-page calls succeed.
+            return make_gemini_response("per-page text")
+
+        processor.client.models.generate_content.side_effect = gen
+        result = processor.process_pdf(sample_pdf, show_progress=False)  # auto (default)
+        assert result.success
+        assert result.mode == "per_page"
+        assert result.fell_back_from_whole_pdf is True
+        # 1 whole-PDF call + 2 per-page calls = 3.
+        assert processor.client.models.generate_content.call_count == 3
+
+    def test_fallback_on_page_shortfall(self, processor, sample_pdf):
+        # Whole-PDF returns markers for only 1 of the 2 pages -> auto-fallback.
+        from tests.conftest import make_gemini_response
+
+        first = {"done": False}
+
+        def gen(*args, **kwargs):
+            if not first["done"]:
+                first["done"] = True
+                # Only ONE page marker for a 2-page PDF (tail dropped), STOP finish.
+                return make_gemini_response("## Page 1\n\nOnly the first page made it.")
+            return make_gemini_response("per-page text")
+
+        processor.client.models.generate_content.side_effect = gen
+        result = processor.process_pdf(sample_pdf, show_progress=False)  # auto
+        assert result.success
+        assert result.mode == "per_page"
+        assert result.fell_back_from_whole_pdf is True
+        assert result.page_count == 2  # per-page recovered both pages
+        assert processor.client.models.generate_content.call_count == 3
+
+    def test_no_fallback_when_complete(self, processor, sample_pdf):
+        # A complete whole-PDF response (all pages, STOP) -> no fallback, 1 call.
+        from tests.conftest import make_gemini_response
+
+        processor.client.models.generate_content.return_value = make_gemini_response(
+            "## Page 1\n\nA\n\n## Page 2\n\nB"
+        )
+        result = processor.process_pdf(sample_pdf, show_progress=False)  # auto
+        assert result.mode == "whole_pdf"
+        assert result.fell_back_from_whole_pdf is False
+        assert processor.client.models.generate_content.call_count == 1
+
+    def test_whole_pdf_mode_does_not_fall_back(self, processor, sample_pdf):
+        # Forced whole_pdf: even a truncated response is kept (no fallback).
+        from tests.conftest import make_gemini_response
+
+        resp = make_gemini_response("## Page 1\n\nonly one page")
+        resp.candidates[0].finish_reason = "MAX_TOKENS"
+        processor.client.models.generate_content.return_value = resp
+        result = processor.process_pdf(sample_pdf, show_progress=False, mode="whole_pdf")
+        assert result.mode == "whole_pdf"
+        assert result.fell_back_from_whole_pdf is False
+        assert processor.client.models.generate_content.call_count == 1
+
+
+class TestTruncationDetection:
+    """Unit tests for the truncation signal logic."""
+
+    def test_max_tokens_finish_reason_truncated(self):
+        from gemini_ocr.processor import is_truncated
+
+        assert is_truncated("MAX_TOKENS", parsed_pages=5, actual_pages=5)
+        assert is_truncated("LENGTH", parsed_pages=2, actual_pages=2)
+
+    def test_page_shortfall_truncated(self):
+        from gemini_ocr.processor import is_truncated
+
+        assert is_truncated("STOP", parsed_pages=1, actual_pages=3)
+
+    def test_complete_not_truncated(self):
+        from gemini_ocr.processor import is_truncated
+
+        assert not is_truncated("STOP", parsed_pages=3, actual_pages=3)
+        # More pages than expected (model over-split) is not a shortfall.
+        assert not is_truncated("STOP", parsed_pages=4, actual_pages=3)
+
+    def test_unknown_page_count_disables_shortfall(self):
+        from gemini_ocr.processor import is_truncated
+
+        assert not is_truncated("STOP", parsed_pages=1, actual_pages=0)
+
+    def test_magicmock_finish_reason_not_truncated(self):
+        # A bare MagicMock finish_reason must never spuriously fire (no length sig).
+        from unittest.mock import MagicMock
+
+        from gemini_ocr.processor import is_truncated
+
+        assert not is_truncated(MagicMock(), parsed_pages=3, actual_pages=3)
+
+
+class TestSplitNativePages:
+    """Tests for the native-response page splitter."""
+
+    def test_empty_returns_no_pages(self):
+        from gemini_ocr.processor import split_native_pages
+
+        assert split_native_pages("") == []
+        assert split_native_pages("   \n  ") == []
+
+    def test_splits_on_markers(self):
+        from gemini_ocr.processor import split_native_pages
+
+        pages = split_native_pages("## Page 1\n\nA\n\n## Page 2\n\nB\n\n## Page 3\n\nC")
+        assert pages == ["A", "B", "C"]
+
+    def test_preamble_prepended_to_first_page(self):
+        from gemini_ocr.processor import split_native_pages
+
+        pages = split_native_pages("preamble\n\n## Page 1\n\nbody")
+        assert len(pages) == 1
+        assert "preamble" in pages[0]
+        assert "body" in pages[0]
+
+    def test_no_markers_single_page(self):
+        from gemini_ocr.processor import split_native_pages
+
+        assert split_native_pages("no markers here") == ["no markers here"]
+
+
+class TestOCRProcessorPerPage:
+    """Tests for per-page PDF processing (opt-in via --per-page)."""
+
+    @pytest.fixture
+    def processor(self, mock_config, mock_genai_client):
+        with patch("gemini_ocr.processor.genai") as mock_genai:
+            mock_genai.Client.return_value = mock_genai_client
+            processor = OCRProcessor(mock_config)
+            processor.client = mock_genai_client
+            return processor
+
+    def test_pdf_produces_one_result_per_page(self, processor, sample_pdf):
+        # sample_pdf fixture has 2 pages -> 2 Gemini calls, 2 page entries.
+        result = processor.process_pdf(sample_pdf, show_progress=False, per_page=True)
+        assert result.success
+        assert result.page_count == 2
+        assert processor.client.models.generate_content.call_count == 2
+
+    def test_pdf_page_failure_is_tracked(self, processor, sample_pdf):
+        from tests.conftest import make_gemini_response
+
+        calls = {"n": 0}
+
+        def gen(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("page 1 boom")
+            return make_gemini_response("ok")
+
+        processor.client.models.generate_content.side_effect = gen
+        result = processor.process_pdf(sample_pdf, show_progress=False, per_page=True)
+        assert not result.success
+        assert 1 in result.page_errors
+        assert result.status.value in ("partial", "failed")
 
 
 class TestOCRProcessorSaveResults:
@@ -158,59 +390,76 @@ class TestOCRProcessorSaveResults:
 
     def test_save_results_creates_per_document_folder(self, processor, tmp_path, sample_image):
         result = OCRResult(
-            file_path=sample_image, text="Test content", success=True, processing_time=1.5
+            file_path=sample_image, pages=["Test content"], success=True, processing_time=1.5
         )
         output_dir = tmp_path / "output"
         output_dir.mkdir()
-        output_path = processor.save_results(result, output_dir)
+        output_path = processor.save_results(result, output_dir, "sample.png")
 
-        # Should be in per-document folder
+        # Should be in per-document folder mirroring the relative key
         assert output_path.parent.name == "sample"
         assert output_path.name == "sample.md"
         assert output_path.exists()
 
-    def test_save_results_clean_markdown(self, processor, tmp_path, sample_image):
+    def test_save_results_clean_markdown_with_page_header(self, processor, tmp_path, sample_image):
         result = OCRResult(
-            file_path=sample_image, text="Test content", success=True, processing_time=1.5
+            file_path=sample_image, pages=["Test content"], success=True, processing_time=1.5
         )
         output_dir = tmp_path / "output"
         output_dir.mkdir()
-        output_path = processor.save_results(result, output_dir)
+        output_path = processor.save_results(result, output_dir, "sample.png")
         content = output_path.read_text()
 
-        # Clean markdown — no headers, no metadata
-        assert content == "Test content"
+        # Clean markdown — page header, no YAML frontmatter
+        assert "## Page 1" in content
+        assert "Test content" in content
+        assert not content.lstrip().startswith("---")
         assert "OCR Results" not in content
-        assert "Processing Time" not in content
 
     def test_save_results_handles_failure(self, processor, tmp_path, sample_image):
         result = OCRResult(
-            file_path=sample_image, text="", success=False, error="API timeout", processing_time=1.0
+            file_path=sample_image,
+            pages=[],
+            success=False,
+            error="API timeout",
+            processing_time=1.0,
         )
         output_dir = tmp_path / "output"
         output_dir.mkdir()
-        output_path = processor.save_results(result, output_dir)
+        output_path = processor.save_results(result, output_dir, "sample.png")
         content = output_path.read_text()
+        # Failure marker present; raw error not leaked into the .md body.
         assert "OCR Failed" in content
-        assert "API timeout" in content
+        assert "API timeout" not in content
 
     def test_save_results_with_extracted_images(self, processor, tmp_path, sample_pdf):
+        # A 1x1 PNG so PIL can open/re-encode it.
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (1, 1), "white").save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
         result = OCRResult(
             file_path=sample_pdf,
-            text="Content",
+            pages=["Content"],
             success=True,
             processing_time=1.0,
             extracted_images=[
-                {"page": 1, "index": 1, "data": b"\x89PNG\r\n", "ext": "png", "width": 100, "height": 100}
+                {"page": 1, "index": 1, "data": png_bytes, "ext": "png", "width": 1, "height": 1}
             ],
         )
         output_dir = tmp_path / "output"
         output_dir.mkdir()
-        processor.save_results(result, output_dir)
+        md_path = processor.save_results(result, output_dir, "sample.pdf")
 
         figures_dir = output_dir / "sample" / "figures"
         assert figures_dir.exists()
-        assert (figures_dir / "page1_img1.png").exists()
+        # Canonical figure naming + resolving link.
+        assert (figures_dir / "figure_1_page1.png").exists()
+        assert "figures/figure_1_page1.png" in md_path.read_text()
 
 
 class TestOCRProcessorErrorHandling:

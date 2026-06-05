@@ -47,6 +47,27 @@ class Config(BaseSettings):
     )
 
     # Processing Configuration
+    #: PDF processing mode:
+    #:   "auto"      — whole-PDF upload (one call), auto-fall-back to per-page if
+    #:                 the whole-PDF response is truncated (DEFAULT).
+    #:   "whole_pdf" — force whole-PDF (one call), NO fallback (accept truncation).
+    #:   "per_page"  — force page-by-page (one call per page) always.
+    pdf_mode: str = Field(
+        default="auto",
+        description="PDF processing mode: auto | whole_pdf | per_page",
+    )
+
+    @field_validator("pdf_mode", mode="before")
+    @classmethod
+    def normalize_pdf_mode(cls, v: str) -> str:
+        """Normalize/validate the PDF mode (tolerant of hyphens / case)."""
+        if not v:
+            return "auto"
+        norm = str(v).strip().lower().replace("-", "_")
+        if norm not in {"auto", "whole_pdf", "per_page"}:
+            raise ValueError(f"Invalid pdf_mode {v!r}; expected auto, whole_pdf, or per_page")
+        return norm
+
     include_images: bool = Field(
         default=True,
         description="Extract and save images from documents",

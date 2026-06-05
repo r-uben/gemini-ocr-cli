@@ -17,9 +17,26 @@ def pytest_collection_modifyitems(items):
 
 # Skip integration tests if no API key
 def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "integration: mark test as requiring GEMINI_API_KEY"
-    )
+    config.addinivalue_line("markers", "integration: mark test as requiring GEMINI_API_KEY")
+
+
+@pytest.fixture(autouse=True)
+def _reset_console_quiet():
+    """Reset the module-level rich Consoles' ``quiet`` state around each test.
+
+    ``gemini_ocr.cli`` and ``gemini_ocr.processor`` hold module-level
+    ``Console()`` singletons, and ``--quiet`` flips ``console.quiet = True`` on
+    them. Without restoring that, a test exercising ``--quiet`` silences every
+    later test's captured output. This guard keeps CLI tests order-independent.
+    """
+    from gemini_ocr import cli as _cli
+    from gemini_ocr import processor as _proc
+
+    saved = (_cli.console.quiet, _proc.console.quiet)
+    try:
+        yield
+    finally:
+        _cli.console.quiet, _proc.console.quiet = saved
 
 
 @pytest.fixture
@@ -75,6 +92,26 @@ def mock_config():
         yield config
 
 
+def make_gemini_response(text: str = "Extracted text from document") -> MagicMock:
+    """Build a GenerateContentResponse mock whose parts yield `text`.
+
+    The processor extracts text by walking ``candidates[0].content.parts`` (the
+    ``.text`` shortcut is unreliable for thinking models), so mocks must supply a
+    real parts structure rather than only ``response.text``.
+    """
+    part = MagicMock()
+    part.text = text
+    part.thought = False
+    content = MagicMock()
+    content.parts = [part]
+    candidate = MagicMock()
+    candidate.content = content
+    candidate.finish_reason = "STOP"
+    resp = MagicMock()
+    resp.candidates = [candidate]
+    return resp
+
+
 @pytest.fixture
 def mock_genai_client():
     """Create a mock Gemini client."""
@@ -86,10 +123,8 @@ def mock_genai_client():
     mock_file.state = "ACTIVE"
     mock_client.files.upload.return_value = mock_file
 
-    # Mock generate_content
-    mock_response = MagicMock()
-    mock_response.text = "Extracted text from document"
-    mock_client.models.generate_content.return_value = mock_response
+    # Mock generate_content with a walkable parts structure
+    mock_client.models.generate_content.return_value = make_gemini_response()
 
     return mock_client
 
@@ -103,6 +138,5 @@ def api_key_available() -> bool:
 def skip_without_api_key(func):
     """Decorator to skip integration tests without API key."""
     return pytest.mark.skipif(
-        not os.environ.get("GEMINI_API_KEY"),
-        reason="GEMINI_API_KEY not set"
+        not os.environ.get("GEMINI_API_KEY"), reason="GEMINI_API_KEY not set"
     )(pytest.mark.integration(func))

@@ -123,14 +123,14 @@ class TestDetermineOutputPath:
         input_file = tmp_path / "test.pdf"
         input_file.touch()
         result = determine_output_path(input_file)
-        assert result == tmp_path / "gemini_ocr_output"
+        assert result == tmp_path / "ocr"
         assert result.exists()
 
     def test_output_path_for_directory(self, tmp_path):
         input_dir = tmp_path / "input"
         input_dir.mkdir()
         result = determine_output_path(input_dir)
-        assert result == input_dir / "gemini_ocr_output"
+        assert result == input_dir / "ocr"
         assert result.exists()
 
     def test_output_path_custom(self, tmp_path):
@@ -186,7 +186,7 @@ class TestGetSupportedFiles:
 
     def test_get_supported_files_excludes_output_dir(self, tmp_path):
         (tmp_path / "root.pdf").touch()
-        output_dir = tmp_path / "gemini_ocr_output"
+        output_dir = tmp_path / "ocr"
         output_dir.mkdir()
         (output_dir / "output.pdf").touch()
 
