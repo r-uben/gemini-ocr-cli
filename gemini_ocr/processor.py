@@ -1,7 +1,7 @@
 """Core OCR processing module using Google Gemini.
 
-PDFs are processed in one of three modes, all routed through the ratified output
-contract (``docs/plans/00-output-contract/DECISION.md``):
+PDFs are processed in one of three modes, all routed through the shared
+``ocr-output-contract`` package (the family-wide output contract):
 
 * **auto** (DEFAULT) — the whole PDF is uploaded once via the Gemini Files API
   and OCR'd in a *single* call. The prompt asks the model to begin each page with
@@ -19,7 +19,8 @@ contract (``docs/plans/00-output-contract/DECISION.md``):
 
 All three produce byte-identical *structure*: one ``<stem>.md`` with ``## Page
 N`` headers, no frontmatter, dual-level metadata, and the uniform exit policy.
-This module owns *how OCR happens*; the contract module owns *where bytes go*.
+This module owns *how OCR happens*; the ``ocr-output-contract`` package owns
+*where bytes go*.
 """
 
 import io
@@ -35,12 +36,8 @@ from typing import Any
 import fitz  # PyMuPDF
 from google import genai
 from google.genai import types
-from PIL import Image
-from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
-
-from gemini_ocr.config import Config
-from gemini_ocr.output_contract import (
+from ocr_output_contract import (
+    TRUNCATION_FINISH_REASONS,
     DocMetadata,
     RootIndex,
     RunOutcome,
@@ -50,13 +47,20 @@ from gemini_ocr.output_contract import (
     figure_filename,
     figure_markdown_link,
     figures_dir_for,
+    is_truncated,
     markdown_path_for,
     relative_key,
     resolve_output_root,
     sha256_checksum,
+    split_native_pages,
     utc_timestamp,
     write_doc_metadata,
 )
+from PIL import Image
+from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
+
+from gemini_ocr.config import Config
 from gemini_ocr.utils import (
     extract_pdf_images,
     format_file_size,
@@ -74,7 +78,7 @@ BACKEND = "gemini-api"
 # Shared console instance — CLI sets .quiet on this directly
 console = Console()
 
-# OCR prompts for the per-page / single-image path. The contract module supplies
+# OCR prompts for the per-page / single-image path. The contract package supplies
 # the ``## Page N`` headers when assembling per-page results, so these prompts ask
 # only for the page body.
 OCR_PROMPTS = {
@@ -118,83 +122,28 @@ OCR_PROMPTS_NATIVE = {
 #: DPI used to rasterize PDF pages before sending them to Gemini (per-page mode).
 PDF_RENDER_DPI = 200
 
-#: Matches a ``## Page N`` boundary header at the start of a line. Used to split a
-#: native single-call response back into per-page sections. Tolerant of leading
-#: whitespace and trailing content on the line.
-_PAGE_MARKER_RE = re.compile(r"^[ \t]*##[ \t]+Page[ \t]+(\d+)\b.*$", re.IGNORECASE | re.MULTILINE)
-
 # --- PDF processing modes ---------------------------------------------------
 #: Mode actually USED for a document (recorded in metadata). Distinct from the
-#: config's requested mode, which may be ``auto``.
+#: config's requested mode, which may be ``auto``. The page-marker convention,
+#: truncation-reason set, and the ``split_native_pages``/``is_truncated`` helpers
+#: now live in the shared ``ocr-output-contract`` package (imported above).
 MODE_WHOLE_PDF = "whole_pdf"
 MODE_PER_PAGE = "per_page"
 
-#: Finish-reason tokens (normalized to upper-case, non-alphanumerics stripped)
-#: that indicate the model's output was cut off by a length/token limit. Used as
-#: one of two truncation signals for auto-fallback. Membership-checked, so a
-#: stray/unset finish_reason (e.g. a bare MagicMock) never matches.
-_TRUNCATION_FINISH_REASONS = {"MAXTOKENS", "MAX_TOKENS", "LENGTH", "MODELLENGTH"}
 
+def _finish_reason_is_length_limited(finish_reason: Any) -> bool:
+    """True if a finish_reason is a length/token-limit token (for messaging only).
 
-def _normalize_finish_reason(finish_reason: Any) -> str:
-    """Normalize a finish_reason (enum, str, or None) to an upper-case token."""
+    Mirrors the contract's internal normalization (``_normalize_finish_reason``
+    is not part of the package's public API). Used to phrase the fallback notice;
+    the actual fallback decision is made by the package's :func:`is_truncated`.
+    """
     if finish_reason is None:
-        return ""
+        return False
     name = getattr(finish_reason, "name", None)
     raw = name if isinstance(name, str) else str(finish_reason)
-    return re.sub(r"[^A-Za-z0-9]", "", raw).upper()
-
-
-def is_truncated(finish_reason: Any, parsed_pages: int, actual_pages: int) -> bool:
-    """Return True if a whole-PDF response looks truncated.
-
-    Two signals, no hardcoded page-count threshold:
-
-    * **finish reason** — the model reports it stopped on a length/token limit
-      (``MAX_TOKENS`` / ``LENGTH``); or
-    * **page shortfall** — fewer ``## Page N`` markers were recovered than the PDF
-      actually has pages (``parsed_pages < actual_pages``), which means the tail
-      of the document was dropped.
-
-    ``actual_pages <= 0`` (page count unknown) disables the shortfall signal.
-    """
-    if _normalize_finish_reason(finish_reason) in _TRUNCATION_FINISH_REASONS:
-        return True
-    # Page shortfall: fewer recovered pages than the PDF actually has.
-    return actual_pages > 0 and parsed_pages < actual_pages
-
-
-def split_native_pages(markdown: str) -> list[str]:
-    """Split a native single-call markdown blob into per-page sections.
-
-    Splits on ``## Page N`` boundary headers (the marker line itself is dropped,
-    since the contract's :func:`assemble_pages` re-adds canonical headers). Any
-    text appearing before the first marker (preamble the model may emit) is
-    prepended to the first page so no content is lost.
-
-    Falls back to a single page (the whole blob) when no markers are present, so
-    the document is still emitted as valid contract output rather than discarded.
-    Returns an empty list only for empty/whitespace-only input.
-    """
-    text = (markdown or "").strip()
-    if not text:
-        return []
-
-    matches = list(_PAGE_MARKER_RE.finditer(markdown))
-    if not matches:
-        # Model ignored the marker instruction: keep everything as one page.
-        return [text]
-
-    pages: list[str] = []
-    preamble = markdown[: matches[0].start()].strip()
-    for i, m in enumerate(matches):
-        body_start = m.end()
-        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
-        body = markdown[body_start:body_end].strip()
-        if i == 0 and preamble:
-            body = (preamble + "\n\n" + body).strip() if body else preamble
-        pages.append(body)
-    return pages
+    token = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    return token in TRUNCATION_FINISH_REASONS
 
 
 @dataclass
@@ -551,7 +500,7 @@ class OCRProcessor:
             if allow_fallback and is_truncated(finish_reason, len(pages), actual_pages):
                 reason = (
                     "length-limited finish reason"
-                    if _normalize_finish_reason(finish_reason) in _TRUNCATION_FINISH_REASONS
+                    if _finish_reason_is_length_limited(finish_reason)
                     else f"recovered {len(pages)} of {actual_pages} page(s)"
                 )
                 if not self.config.quiet:
@@ -723,7 +672,7 @@ class OCRProcessor:
             raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
     # ------------------------------------------------------------------
-    # Output writing (all routed through the contract module)
+    # Output writing (all routed through the ocr-output-contract package)
     # ------------------------------------------------------------------
 
     def save_results(
@@ -734,7 +683,7 @@ class OCRProcessor:
     ) -> Path:
         """Write the aggregated markdown + figures for one document.
 
-        The layout is determined entirely by the contract module:
+        The layout is determined entirely by the contract package:
         ``<output_root>/<rel/dir>/<stem>/<stem>.md`` plus a ``figures/`` folder.
         Figures are normalised to PNG and named ``figure_<N>_page<P>.png`` with
         resolving links appended to the markdown.

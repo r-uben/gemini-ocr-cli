@@ -277,68 +277,11 @@ class TestOCRProcessorAutoFallback:
         assert processor.client.models.generate_content.call_count == 1
 
 
-class TestTruncationDetection:
-    """Unit tests for the truncation signal logic."""
-
-    def test_max_tokens_finish_reason_truncated(self):
-        from gemini_ocr.processor import is_truncated
-
-        assert is_truncated("MAX_TOKENS", parsed_pages=5, actual_pages=5)
-        assert is_truncated("LENGTH", parsed_pages=2, actual_pages=2)
-
-    def test_page_shortfall_truncated(self):
-        from gemini_ocr.processor import is_truncated
-
-        assert is_truncated("STOP", parsed_pages=1, actual_pages=3)
-
-    def test_complete_not_truncated(self):
-        from gemini_ocr.processor import is_truncated
-
-        assert not is_truncated("STOP", parsed_pages=3, actual_pages=3)
-        # More pages than expected (model over-split) is not a shortfall.
-        assert not is_truncated("STOP", parsed_pages=4, actual_pages=3)
-
-    def test_unknown_page_count_disables_shortfall(self):
-        from gemini_ocr.processor import is_truncated
-
-        assert not is_truncated("STOP", parsed_pages=1, actual_pages=0)
-
-    def test_magicmock_finish_reason_not_truncated(self):
-        # A bare MagicMock finish_reason must never spuriously fire (no length sig).
-        from unittest.mock import MagicMock
-
-        from gemini_ocr.processor import is_truncated
-
-        assert not is_truncated(MagicMock(), parsed_pages=3, actual_pages=3)
-
-
-class TestSplitNativePages:
-    """Tests for the native-response page splitter."""
-
-    def test_empty_returns_no_pages(self):
-        from gemini_ocr.processor import split_native_pages
-
-        assert split_native_pages("") == []
-        assert split_native_pages("   \n  ") == []
-
-    def test_splits_on_markers(self):
-        from gemini_ocr.processor import split_native_pages
-
-        pages = split_native_pages("## Page 1\n\nA\n\n## Page 2\n\nB\n\n## Page 3\n\nC")
-        assert pages == ["A", "B", "C"]
-
-    def test_preamble_prepended_to_first_page(self):
-        from gemini_ocr.processor import split_native_pages
-
-        pages = split_native_pages("preamble\n\n## Page 1\n\nbody")
-        assert len(pages) == 1
-        assert "preamble" in pages[0]
-        assert "body" in pages[0]
-
-    def test_no_markers_single_page(self):
-        from gemini_ocr.processor import split_native_pages
-
-        assert split_native_pages("no markers here") == ["no markers here"]
+# NOTE: The truncation-signal logic (``is_truncated``) and the native-response
+# page splitter (``split_native_pages``) now live in the shared
+# ``ocr-output-contract`` package and are unit-tested there. gemini only tests how
+# those helpers behave WHEN DRIVEN by its processor (native/auto-fallback tests
+# below), not the helpers in isolation.
 
 
 class TestOCRProcessorPerPage:

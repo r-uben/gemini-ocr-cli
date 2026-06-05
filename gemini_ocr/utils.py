@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
-
-from gemini_ocr.output_contract import DEFAULT_OUTPUT_DIRNAME, resolve_output_root
+from ocr_output_contract import DEFAULT_OUTPUT_DIRNAME, resolve_output_root
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +83,9 @@ def determine_output_path(
 ) -> Path:
     """Determine and create the output root directory (canon: ``<parent>/ocr/``).
 
-    Thin wrapper over :func:`gemini_ocr.output_contract.resolve_output_root`
-    that also creates the directory. Output-shape logic lives in the contract
-    module; this helper exists for backward-compatible callers.
+    Thin wrapper over :func:`ocr_output_contract.resolve_output_root` that also
+    creates the directory. Output-shape logic lives in the shared contract
+    package; this helper exists for backward-compatible callers.
     """
     base_output = resolve_output_root(input_path, output_path)
     base_output.mkdir(parents=True, exist_ok=True)
