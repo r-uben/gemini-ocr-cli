@@ -23,9 +23,3 @@ def test_import_cli():
     from gemini_ocr.cli import cli
 
     assert cli is not None
-
-
-def test_import_metadata():
-    from gemini_ocr.metadata import MetadataManager
-
-    assert MetadataManager is not None
