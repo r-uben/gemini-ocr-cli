@@ -37,6 +37,7 @@ import fitz  # PyMuPDF
 from google import genai
 from google.genai import types
 from ocr_output_contract import (
+    PAGE_MARKER_RE,
     TRUNCATION_FINISH_REASONS,
     DocMetadata,
     RootIndex,
@@ -52,6 +53,7 @@ from ocr_output_contract import (
     relative_key,
     resolve_output_root,
     run_fingerprint,
+    safe_checksum,
     sha256_checksum,
     split_native_pages,
     utc_timestamp,
@@ -123,6 +125,15 @@ OCR_PROMPTS_NATIVE = {
 #: DPI used to rasterize PDF pages before sending them to Gemini (per-page mode).
 PDF_RENDER_DPI = 200
 
+#: Wall-clock deadline (seconds) for the Files-API upload to leave the PROCESSING
+#: state. Native whole-PDF is the DEFAULT path, so an upload stuck in PROCESSING
+#: would otherwise hang a worker (or the whole single-file run) forever with no
+#: durable status=failed record. On timeout we raise so the per-file isolation
+#: records status=failed and the batch continues (canon SYS-02).
+UPLOAD_POLL_TIMEOUT_S = 300.0
+#: Interval (seconds) between Files-API state polls.
+UPLOAD_POLL_INTERVAL_S = 0.5
+
 # --- PDF processing modes ---------------------------------------------------
 #: Mode actually USED for a document (recorded in metadata). Distinct from the
 #: config's requested mode, which may be ``auto``. The page-marker convention,
@@ -147,6 +158,23 @@ def _finish_reason_is_length_limited(finish_reason: Any) -> bool:
     return token in TRUNCATION_FINISH_REASONS
 
 
+def _recover_page_numbers(text: str) -> list[int]:
+    """Extract the physical page numbers from a native ``## Page N`` blob.
+
+    Returns the integers captured by the contract's ``PAGE_MARKER_RE``, in the
+    order the markers appear and aligned 1:1 with :func:`split_native_pages`
+    output. These are fed to the contract's tail-aware :func:`is_truncated`
+    (so a blank interior page is not a false truncation while a dropped tail
+    still is) and to :func:`assemble_pages` (so a model-skipped page is not
+    silently renumbered under ``--whole-pdf``).
+
+    Falls back to ``[]`` when the model emitted no markers; callers treat that
+    (one undivided page) by NOT passing page numbers, so the single page is
+    labeled ``## Page 1`` as before.
+    """
+    return [int(m.group(1)) for m in PAGE_MARKER_RE.finditer(text or "")]
+
+
 @dataclass
 class OCRResult:
     """Result from processing a document (one or more pages).
@@ -169,6 +197,12 @@ class OCRResult:
     #: True when ``auto`` mode tried whole-PDF, detected truncation, and redid the
     #: document page-by-page. Recorded in metadata so the fallback is non-silent.
     fell_back_from_whole_pdf: bool = False
+    #: Physical PDF page numbers recovered from the native ``## Page N`` markers,
+    #: aligned 1:1 with ``pages``. Set only on the whole-PDF path; ``None`` for the
+    #: per-page path (which already labels pages 1..N by construction). Passed to
+    #: ``assemble_pages(page_numbers=...)`` so a model-skipped page is NOT silently
+    #: renumbered under ``--whole-pdf``.
+    recovered_page_numbers: list[int] | None = None
 
     @property
     def page_count(self) -> int:
@@ -325,8 +359,22 @@ class OCRProcessor:
 
         uploaded = self.client.files.upload(file=str(file_path))
 
+        # Bound the PROCESSING poll: an upload stuck in PROCESSING must not hang a
+        # worker / single-file run forever on the now-default native path. On
+        # timeout, delete the orphan remote object and raise so the per-file
+        # failure path records status=failed and the batch continues (SYS-02).
+        deadline = time.monotonic() + UPLOAD_POLL_TIMEOUT_S
         while uploaded.state == "PROCESSING":
-            time.sleep(0.5)
+            if time.monotonic() >= deadline:
+                try:
+                    self.client.files.delete(name=uploaded.name)
+                except Exception as del_err:
+                    logger.debug(f"Failed to delete stuck-upload remote file: {del_err}")
+                raise RuntimeError(
+                    f"File upload stuck in PROCESSING after {UPLOAD_POLL_TIMEOUT_S:.0f}s: "
+                    f"{file_path.name}"
+                )
+            time.sleep(UPLOAD_POLL_INTERVAL_S)
             uploaded = self.client.files.get(name=uploaded.name)
 
         if uploaded.state == "FAILED":
@@ -517,9 +565,27 @@ class OCRProcessor:
                     mode=MODE_WHOLE_PDF,
                 )
 
-            # Auto-fallback: a truncated whole-PDF response means the tail of the
-            # document was dropped. Redo the doc page-by-page and use that result.
-            if allow_fallback and is_truncated(finish_reason, len(pages), actual_pages):
+            # Recover the PHYSICAL page numbers the model stamped in its markers
+            # (aligned 1:1 with ``pages``). These drive the tail-aware truncation
+            # check below and preserve source page identity on the whole-PDF path.
+            recovered = _recover_page_numbers(text)
+            # Only use recovered numbers when they align 1:1 with the recovered
+            # pages (markers present and counts match). A marker-less blob yields
+            # [], and the rare split/marker count mismatch falls back to 1..N
+            # labeling rather than risking a misaligned page_numbers list.
+            recovered_page_numbers = recovered if len(recovered) == len(pages) else None
+
+            # Auto-fallback: a truncated whole-PDF response means the TAIL of the
+            # document was dropped. The v0.1.2 contract infers this from the
+            # recovered marker numbers (max recovered < actual_pages), so a blank
+            # interior page no longer false-triggers a full per-page re-OCR while a
+            # genuinely dropped tail still does. Redo page-by-page and use that.
+            if allow_fallback and is_truncated(
+                finish_reason,
+                len(pages),
+                actual_pages,
+                recovered_page_numbers=recovered_page_numbers,
+            ):
                 reason = (
                     "length-limited finish reason"
                     if _finish_reason_is_length_limited(finish_reason)
@@ -552,6 +618,7 @@ class OCRProcessor:
                 processing_time=time.time() - start_time,
                 extracted_images=extracted_images,
                 mode=MODE_WHOLE_PDF,
+                recovered_page_numbers=recovered_page_numbers,
             )
         except Exception as e:
             logger.error(f"Error processing {pdf_path}: {e}")
@@ -718,8 +785,16 @@ class OCRProcessor:
         markdown_path = markdown_path_for(doc_dir, rel_key)
 
         # Build the clean markdown body: pages under ## Page N, no frontmatter.
+        # On the whole-PDF path, pass the recovered PHYSICAL page numbers so a
+        # model-skipped page (e.g. markers 1,3 with 2 omitted) is labeled by its
+        # source number instead of being silently renumbered to 1..N. The per-page
+        # path leaves recovered_page_numbers=None and is labeled 1..N as before.
         if result.pages:
-            body = assemble_pages(result.pages)
+            page_numbers = result.recovered_page_numbers
+            if page_numbers is not None and len(page_numbers) == len(result.pages):
+                body = assemble_pages(result.pages, page_numbers=page_numbers)
+            else:
+                body = assemble_pages(result.pages)
         else:
             body = "*[OCR Failed]*\n"
 
@@ -867,10 +942,26 @@ class OCRProcessor:
         if any file or page failed, across both single-file and batch runs.
         """
         # Stamp the run-config fingerprint so a re-run under a different
-        # model/backend/task/prompt invalidates the cache and reprocesses,
-        # instead of silently reusing output keyed only on the input checksum.
+        # model/backend/task/prompt OR a different output-affecting flag
+        # invalidates the cache and reprocesses, instead of silently reusing
+        # output keyed only on the input checksum. ``extra`` carries the RESOLVED
+        # effective flags that change what output an input produces:
+        #   * ``pdf_mode`` — a completed/truncated ``--whole-pdf`` run must NOT be
+        #     skipped on a later default ``auto`` run (auto would then never get a
+        #     chance to fall back to per-page).
+        #   * ``include_images`` — a ``--no-images`` run must NOT be skipped on a
+        #     later ``--include-images`` run (figures would stay permanently
+        #     missing). Single images are unaffected by pdf_mode but the flag set
+        #     is uniform per run, so both are always folded in.
         self._run_fingerprint = run_fingerprint(
-            self.model_name, BACKEND, task=task, prompt=custom_prompt
+            self.model_name,
+            BACKEND,
+            task=task,
+            prompt=custom_prompt,
+            extra={
+                "pdf_mode": self.config.pdf_mode,
+                "include_images": self.config.include_images,
+            },
         )
         if input_path.is_file():
             return self._process_single_file(
@@ -897,8 +988,21 @@ class OCRProcessor:
         rel_key = relative_key(file_path, scan_root)
         index = RootIndex(output_root)
 
+        # Checksum via safe_checksum: an unreadable/race-deleted input must be
+        # recorded status=failed (durable), not raise OSError out of the run
+        # (canon SYS-02). None => skip the idempotency check, fall through, and
+        # let the per-file failure path persist a failed record below.
+        checksum = safe_checksum(file_path)
+        if checksum is None:
+            error = f"Input file is unreadable: {file_path}"
+            logger.error(error)
+            self._persist_failure(error, file_path, output_root, rel_key, index)
+            outcome.add(Status.FAILED, detail=rel_key)
+            console.print(f"\n[red]Failed:[/red] {error}")
+            return outcome
+
         if not reprocess and index.is_completed(
-            rel_key, sha256_checksum(file_path), fingerprint=self._run_fingerprint
+            rel_key, checksum, fingerprint=self._run_fingerprint
         ):
             console.print(f"[yellow]Already processed:[/yellow] {file_path.name}")
             console.print("[dim]Use --reprocess to force reprocessing[/dim]")
@@ -960,8 +1064,23 @@ class OCRProcessor:
         files_to_process: list[tuple[Path, str]] = []
         for f in files:
             rel_key = relative_key(f, dir_path)
+            # safe_checksum tolerates an input that became unreadable between
+            # discovery and this pre-filter (permission denied, race-deleted,
+            # broken symlink). On None we record a durable status=failed for THIS
+            # file and CONTINUE the batch, instead of letting OSError abort the
+            # whole run with zero output (canon SYS-02: one bad file never aborts
+            # the batch). The checksum was previously computed OUTSIDE the
+            # per-file try, so an unreadable mid-batch file killed everything.
+            checksum = safe_checksum(f)
+            if checksum is None:
+                error = f"Input file is unreadable: {f}"
+                logger.error(error)
+                self._persist_failure(error, f, output_root, rel_key, index)
+                outcome.add(Status.FAILED, detail=rel_key)
+                console.print(f"  [red]ERROR: {error}[/red]\n")
+                continue
             if not reprocess and index.is_completed(
-                rel_key, sha256_checksum(f), fingerprint=self._run_fingerprint
+                rel_key, checksum, fingerprint=self._run_fingerprint
             ):
                 if self.config.verbose:
                     console.print(f"[dim]Skipping: {rel_key}[/dim]")
@@ -972,8 +1091,13 @@ class OCRProcessor:
                 files_to_process.append((f, rel_key))
 
         if not files_to_process:
-            console.print("[green]All files already processed[/green]")
-            console.print("[dim]Use --reprocess to force reprocessing[/dim]")
+            # Nothing left to OCR. Distinguish "all cached" from "the only files
+            # were unreadable and already recorded status=failed in the pre-filter".
+            if outcome.has_failures:
+                console.print("[red]No processable files (unreadable inputs recorded failed)[/red]")
+            else:
+                console.print("[green]All files already processed[/green]")
+                console.print("[dim]Use --reprocess to force reprocessing[/dim]")
             return outcome
 
         console.print(f"[blue]Processing {len(files_to_process)} file(s)...[/blue]")
@@ -987,12 +1111,14 @@ class OCRProcessor:
             )
         else:
             for file_path, rel_key in files_to_process:
-                file_size = format_file_size(file_path.stat().st_size)
-                console.print(f"[cyan]{rel_key}[/cyan] ({file_size})")
                 # Each file is isolated: a pre-OCRResult exception (oversized file,
-                # unsupported type, _persist error) is recorded as status=failed and
-                # the loop CONTINUES so one bad file never aborts the batch.
+                # unsupported type, _persist error, OR a now-race-deleted input
+                # whose stat() raises) is recorded as status=failed and the loop
+                # CONTINUES so one bad file never aborts the batch (canon SYS-02).
+                # The stat()/size print lives INSIDE the try for that reason.
                 try:
+                    file_size = format_file_size(file_path.stat().st_size)
+                    console.print(f"[cyan]{rel_key}[/cyan] ({file_size})")
                     result = self.process_file(
                         file_path, task=task, custom_prompt=custom_prompt, show_progress=False
                     )

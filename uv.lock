@@ -266,7 +266,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
     { name = "google-genai", specifier = ">=1.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "ocr-output-contract", git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.0" },
+    { name = "ocr-output-contract", git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.2" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
@@ -508,8 +508,8 @@ wheels = [
 
 [[package]]
 name = "ocr-output-contract"
-version = "0.1.0"
-source = { git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.0#6e684de97d0ac484ecd8b1ae70c68a8b56d65413" }
+version = "0.1.2"
+source = { git = "https://github.com/r-uben/ocr-output-contract?rev=v0.1.2#c575222d71d724a4af8e8240051fd6b95c5f4dfa" }
 
 [[package]]
 name = "packaging"

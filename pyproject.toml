@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "ocr-output-contract @ git+https://github.com/r-uben/ocr-output-contract@v0.1.1",
+    "ocr-output-contract @ git+https://github.com/r-uben/ocr-output-contract@v0.1.2",
     "google-genai>=1.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",

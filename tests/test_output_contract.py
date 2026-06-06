@@ -418,3 +418,201 @@ class TestNativeAndFallbackConformance:
         root_entry = json.loads((out / "metadata.json").read_text())["files"]["sample.pdf"]
         assert root_entry["mode"] == "per_page"
         assert root_entry["fell_back_from_whole_pdf"] is True
+
+
+class TestUnreadableInputBatchResilience:
+    """SYS-02 (round-2 HIGH): an unreadable/race-deleted input must be recorded
+    status=failed and the rest of the batch must still process. The pre-filter
+    checksum used to run OUTSIDE per-file isolation (bare ``sha256_checksum``), so
+    a chmod-000 file mid-batch aborted the WHOLE run (zero output, zero failed
+    records). The v0.1.2 ``safe_checksum`` wrap fixes it.
+    """
+
+    def test_chmod000_file_mid_batch_does_not_abort_others(self, processor, tmp_path):
+        import os
+        import stat
+
+        root = tmp_path / "in"
+        root.mkdir()
+        _make_multipage_pdf(root / "a.pdf", n_pages=1)
+        bad = root / "bad.pdf"
+        _make_multipage_pdf(bad, n_pages=1)
+        _make_multipage_pdf(root / "c.pdf", n_pages=1)
+
+        processor.client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response(
+            "ok"
+        )
+
+        # Make the middle file unreadable AFTER discovery would see it.
+        os.chmod(bad, 0)
+        try:
+            out = tmp_path / "out"
+            outcome = processor.process(root, output_path=out)
+
+            # The whole batch was attempted: the two good files completed, the
+            # unreadable file is recorded failed, and the exit code is nonzero.
+            assert outcome.exit_code != 0
+            assert outcome.completed == 2
+            assert outcome.failed == 1
+
+            # A durable status=failed record exists for the unreadable file.
+            bad_meta = json.loads((out / "bad" / "metadata.json").read_text())
+            assert bad_meta["status"] == "failed"
+            assert "unreadable" in bad_meta["error"].lower()
+
+            # The good files conform and were NOT skipped.
+            assert_conforms(
+                out,
+                [
+                    ExpectedDoc(rel_key="a.pdf", pages=1, status="completed"),
+                    ExpectedDoc(rel_key="c.pdf", pages=1, status="completed"),
+                ],
+            )
+            root_idx = json.loads((out / "metadata.json").read_text())["files"]
+            assert root_idx["bad.pdf"]["status"] == "failed"
+        finally:
+            os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_single_unreadable_file_records_failed_not_abort(self, processor, tmp_path):
+        import os
+        import stat
+
+        bad = tmp_path / "lonely.pdf"
+        _make_multipage_pdf(bad, n_pages=1)
+        os.chmod(bad, 0)
+        try:
+            out = tmp_path / "out"
+            outcome = processor.process(bad, output_path=out)
+            assert outcome.exit_code != 0
+            assert outcome.failed == 1
+            meta = json.loads((out / "lonely" / "metadata.json").read_text())
+            assert meta["status"] == "failed"
+            assert "unreadable" in meta["error"].lower()
+        finally:
+            os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)
+
+
+class TestBlankInteriorPageNoNeedlessFallback:
+    """round-2 MEDIUM: a legitimately-blank interior page (a marker the model
+    omits) must NOT false-trigger a full per-page re-OCR. The v0.1.2 tail-aware
+    ``is_truncated`` only fires when the END of the document is missing; gemini
+    feeds it the recovered ``## Page N`` marker numbers so this works.
+    """
+
+    def test_blank_interior_page_keeps_whole_pdf_no_fallback(self, native_processor, tmp_path):
+        pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=3)
+        out = tmp_path / "out"
+        # Model omits the BLANK page 2 but stamps physical markers 1 and 3, and
+        # stops cleanly (STOP). max(recovered={1,3})==3==actual -> NOT truncated.
+        native_processor.client.models.generate_content.return_value = _mock_page_response(
+            "## Page 1\n\nP1 text\n\n## Page 3\n\nP3 text", finish_reason="STOP"
+        )
+
+        outcome = native_processor.process(pdf, output_path=out)
+        assert outcome.exit_code == 0
+        # Exactly one whole-PDF call: NO needless per-page fallback.
+        assert native_processor.client.models.generate_content.call_count == 1
+
+        doc_meta = json.loads((out / "sample" / "metadata.json").read_text())
+        assert doc_meta["mode"] == "whole_pdf"
+        assert doc_meta["fell_back_from_whole_pdf"] is False
+
+        # Source page identity preserved: the body keeps ## Page 3, not a
+        # silently-renumbered ## Page 2 (assemble_pages got the marker numbers).
+        body = (out / "sample" / "sample.md").read_text()
+        assert "## Page 1" in body
+        assert "## Page 3" in body
+        assert "## Page 2" not in body
+
+    def test_dropped_tail_still_triggers_fallback(self, native_processor, tmp_path):
+        # Contrast: a genuinely dropped TAIL (markers 1,2 of a 3-page doc) must
+        # still fall back, so the tail check does not over-suppress.
+        pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=3)
+        out = tmp_path / "out"
+
+        first = {"done": False}
+
+        def gen(*args, **kwargs):
+            if not first["done"]:
+                first["done"] = True
+                # max(recovered={1,2})==2 < actual=3 -> truncated tail.
+                return _mock_page_response(
+                    "## Page 1\n\nP1\n\n## Page 2\n\nP2", finish_reason="STOP"
+                )
+            return _mock_page_response("recovered page text")
+
+        native_processor.client.models.generate_content.side_effect = gen
+        outcome = native_processor.process(pdf, output_path=out)
+        assert outcome.exit_code == 0
+        # 1 whole-PDF call + 3 per-page fallback calls.
+        assert native_processor.client.models.generate_content.call_count == 4
+        doc_meta = json.loads((out / "sample" / "metadata.json").read_text())
+        assert doc_meta["mode"] == "per_page"
+        assert doc_meta["fell_back_from_whole_pdf"] is True
+
+
+class TestCrossModeFingerprintReprocess:
+    """round-2 HIGH: the idempotency fingerprint must fold in the resolved
+    output-affecting flags (``pdf_mode``, ``include_images``) so a cross-mode
+    re-run reprocesses instead of silently reusing the cached result.
+    """
+
+    def _make_proc(self, mock_config, mock_genai_client, *, pdf_mode, include_images):
+        mock_config.pdf_mode = pdf_mode
+        mock_config.include_images = include_images
+        with patch("gemini_ocr.processor.genai") as mg:
+            mg.Client.return_value = mock_genai_client
+            p = OCRProcessor(mock_config)
+            p.client = mock_genai_client
+            return p
+
+    def test_whole_pdf_then_auto_reprocesses(self, mock_config, mock_genai_client, tmp_path):
+        pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=2)
+        out = tmp_path / "out"
+        # Complete whole-PDF response so the first (whole_pdf) run is COMPLETED
+        # and would otherwise be a cache hit on the second run.
+        mock_genai_client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response(
+            "## Page 1\n\nA\n\n## Page 2\n\nB", finish_reason="STOP"
+        )
+
+        p1 = self._make_proc(
+            mock_config, mock_genai_client, pdf_mode="whole_pdf", include_images=True
+        )
+        p1.process(pdf, output_path=out)
+        calls_after_first = mock_genai_client.models.generate_content.call_count
+        assert calls_after_first >= 1
+
+        # Re-run in the SAME mode -> cache hit, no new OCR call.
+        p_same = self._make_proc(
+            mock_config, mock_genai_client, pdf_mode="whole_pdf", include_images=True
+        )
+        p_same.process(pdf, output_path=out)
+        assert mock_genai_client.models.generate_content.call_count == calls_after_first
+
+        # Re-run in a DIFFERENT mode (auto) -> fingerprint mismatch -> reprocess,
+        # so auto gets a chance to evaluate the response (and fall back if needed).
+        p2 = self._make_proc(mock_config, mock_genai_client, pdf_mode="auto", include_images=True)
+        p2.process(pdf, output_path=out)
+        assert mock_genai_client.models.generate_content.call_count > calls_after_first
+        meta = json.loads((out / "sample" / "metadata.json").read_text())
+        assert meta["fingerprint"].startswith("fp:")
+
+    def test_include_images_toggle_reprocesses(self, mock_config, mock_genai_client, tmp_path):
+        pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=1)
+        out = tmp_path / "out"
+        mock_genai_client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response(
+            "## Page 1\n\nA", finish_reason="STOP"
+        )
+
+        p1 = self._make_proc(
+            mock_config, mock_genai_client, pdf_mode="whole_pdf", include_images=False
+        )
+        p1.process(pdf, output_path=out)
+        calls_after_first = mock_genai_client.models.generate_content.call_count
+
+        # Flip --include-images on: must reprocess (else figures stay missing).
+        p2 = self._make_proc(
+            mock_config, mock_genai_client, pdf_mode="whole_pdf", include_images=True
+        )
+        p2.process(pdf, output_path=out)
+        assert mock_genai_client.models.generate_content.call_count > calls_after_first
