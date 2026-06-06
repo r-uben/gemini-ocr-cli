@@ -77,7 +77,7 @@ class TestSanitizeFilename:
         [
             ("normal_file", "normal_file"),
             ("file with spaces", "file_with_spaces"),
-            ("file<>:\"/\\|?*name", "file_name"),
+            ('file<>:"/\\|?*name', "file_name"),
             ("multiple   spaces", "multiple_spaces"),
             ("___leading_trailing___", "leading_trailing"),
             ("", "unnamed"),
@@ -123,14 +123,14 @@ class TestDetermineOutputPath:
         input_file = tmp_path / "test.pdf"
         input_file.touch()
         result = determine_output_path(input_file)
-        assert result == tmp_path / "gemini_ocr_output"
+        assert result == tmp_path / "ocr"
         assert result.exists()
 
     def test_output_path_for_directory(self, tmp_path):
         input_dir = tmp_path / "input"
         input_dir.mkdir()
         result = determine_output_path(input_dir)
-        assert result == input_dir / "gemini_ocr_output"
+        assert result == input_dir / "ocr"
         assert result.exists()
 
     def test_output_path_custom(self, tmp_path):
@@ -143,7 +143,12 @@ class TestDetermineOutputPath:
 
 
 class TestGetSupportedFiles:
-    """Tests for finding supported files."""
+    """Tests for finding supported files.
+
+    Discovery now delegates to the shared contract's ``iter_input_files``: it is
+    always recursive and excludes the RESOLVED output root (not a generic 'ocr'
+    name match). Callers resolve the output root first and pass it in.
+    """
 
     def test_get_supported_files_recursive(self, tmp_path):
         (tmp_path / "root.pdf").touch()
@@ -152,7 +157,7 @@ class TestGetSupportedFiles:
         (tmp_path / "sub" / "image.png").touch()
         (tmp_path / "ignored.txt").touch()
 
-        files = get_supported_files(tmp_path, recursive=True)
+        files = get_supported_files(tmp_path, tmp_path / "ocr")
 
         assert len(files) == 3
         names = [f.name for f in files]
@@ -161,18 +166,8 @@ class TestGetSupportedFiles:
         assert "image.png" in names
         assert "ignored.txt" not in names
 
-    def test_get_supported_files_non_recursive(self, tmp_path):
-        (tmp_path / "root.pdf").touch()
-        (tmp_path / "sub").mkdir()
-        (tmp_path / "sub" / "nested.pdf").touch()
-
-        files = get_supported_files(tmp_path, recursive=False)
-
-        assert len(files) == 1
-        assert files[0].name == "root.pdf"
-
     def test_get_supported_files_empty_directory(self, tmp_path):
-        files = get_supported_files(tmp_path)
+        files = get_supported_files(tmp_path, tmp_path / "ocr")
         assert files == []
 
     def test_get_supported_files_sorted(self, tmp_path):
@@ -180,17 +175,31 @@ class TestGetSupportedFiles:
         (tmp_path / "a.pdf").touch()
         (tmp_path / "b.pdf").touch()
 
-        files = get_supported_files(tmp_path)
+        files = get_supported_files(tmp_path, tmp_path / "ocr")
         names = [f.name for f in files]
         assert names == ["a.pdf", "b.pdf", "c.pdf"]
 
     def test_get_supported_files_excludes_output_dir(self, tmp_path):
         (tmp_path / "root.pdf").touch()
-        output_dir = tmp_path / "gemini_ocr_output"
+        output_dir = tmp_path / "ocr"
         output_dir.mkdir()
         (output_dir / "output.pdf").touch()
 
-        files = get_supported_files(tmp_path, recursive=True)
+        files = get_supported_files(tmp_path, output_dir)
         names = [f.name for f in files]
         assert "root.pdf" in names
         assert "output.pdf" not in names
+
+    def test_get_supported_files_processes_inputs_under_ocr_named_tree(self, tmp_path):
+        # Regression for the HIGH 'excludes any path component named ocr' bug:
+        # inputs living under a directory literally named 'ocr' (e.g. the user's
+        # own .../toolkits/ocr/... tree) MUST still be discovered. Only the
+        # RESOLVED output root is excluded.
+        scan_root = tmp_path / "toolkits" / "ocr" / "papers"
+        scan_root.mkdir(parents=True)
+        (scan_root / "paper.pdf").touch()
+        output_root = scan_root / "ocr"  # the resolved <input>/ocr/ output root
+
+        files = get_supported_files(scan_root, output_root)
+        names = [f.name for f in files]
+        assert "paper.pdf" in names

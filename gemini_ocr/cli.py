@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import click
+from ocr_output_contract import resolve_output_root
 from rich.console import Console
 from rich.table import Table
 
@@ -51,8 +52,8 @@ def _resolve_path(path: Path) -> Path:
 @click.option(
     "--model",
     type=str,
-    default="gemini-3-flash-preview",
-    help="Gemini model to use (default: gemini-3-flash-preview)",
+    default=None,
+    help="Gemini model to use (default: gemini-3-flash-preview / $GEMINI_MODEL)",
 )
 @click.option(
     "--task",
@@ -66,14 +67,33 @@ def _resolve_path(path: Path) -> Path:
     help="Custom prompt for OCR processing",
 )
 @click.option(
+    "--per-page",
+    is_flag=True,
+    default=False,
+    help=(
+        "Force page-by-page OCR (one Gemini call per page) for PDFs. Slower but "
+        "gives honest per-page failure tracking."
+    ),
+)
+@click.option(
+    "--whole-pdf",
+    is_flag=True,
+    default=False,
+    help=(
+        "Force whole-PDF OCR (one call per document) with NO truncation fallback. "
+        "Cheapest, but a long doc may be silently truncated."
+    ),
+)
+@click.option(
     "--include-images/--no-images",
-    default=True,
-    help="Extract embedded images (default: True)",
+    default=None,
+    help="Extract embedded figures (default: True / $GEMINI_INCLUDE_IMAGES)",
 )
 @click.option(
     "--save-originals/--no-save-originals",
-    default=True,
-    help="Save original input images alongside results (default: True)",
+    default=None,
+    hidden=True,
+    help="Deprecated no-op: the output contract does not copy original inputs.",
 )
 @click.option(
     "--reprocess",
@@ -95,8 +115,8 @@ def _resolve_path(path: Path) -> Path:
     "-w",
     "--workers",
     type=click.IntRange(min=1),
-    default=1,
-    help="Number of concurrent workers (default: 1)",
+    default=None,
+    help="Number of concurrent workers (default: 1 / $GEMINI_MAX_WORKERS)",
 )
 @click.option(
     "-v",
@@ -119,15 +139,17 @@ def cli(
     input_path: Path,
     output_dir: Path | None,
     api_key: str | None,
-    model: str,
+    model: str | None,
     task: str,
     prompt: str | None,
-    include_images: bool,
-    save_originals: bool,
+    per_page: bool,
+    whole_pdf: bool,
+    include_images: bool | None,
+    save_originals: bool | None,  # deprecated no-op
     reprocess: bool,
     dry_run: bool,
     quiet: bool,
-    workers: int,
+    workers: int | None,
     verbose: bool,
     env_file: Path | None,
     info: bool,
@@ -145,6 +167,11 @@ def cli(
         gemini-ocr --info
     """
     setup_logging(verbose=verbose)
+
+    # Mode flags are mutually exclusive (default, with neither, is "auto").
+    if per_page and whole_pdf:
+        console.print("[red]Error:[/red] --per-page and --whole-pdf are mutually exclusive")
+        sys.exit(1)
 
     # Handle --info flag
     if info:
@@ -167,7 +194,7 @@ def cli(
 
     # Handle --dry-run (no API key needed)
     if dry_run:
-        _dry_run(input_path)
+        _dry_run(input_path, output_dir)
         return
 
     try:
@@ -181,20 +208,30 @@ def cli(
         if api_key:
             config.api_key = api_key
 
-        # Override with CLI options
-        config.model = model
-        config.include_images = include_images
-        config.save_original_images = save_originals
+        # Override config only when a flag was explicitly passed, so env-var /
+        # .env precedence (GEMINI_MODEL, GEMINI_INCLUDE_IMAGES, GEMINI_MAX_WORKERS)
+        # is respected rather than clobbered by click defaults.
+        if model is not None:
+            config.model = model
+        # Mode flags override; when neither is passed, keep the config/env value
+        # (GEMINI_PDF_MODE, default "auto") rather than clobbering it.
+        if per_page:
+            config.pdf_mode = "per_page"
+        elif whole_pdf:
+            config.pdf_mode = "whole_pdf"
+        if include_images is not None:
+            config.include_images = include_images
+        if workers is not None:
+            config.max_workers = workers
         config.verbose = verbose
         config.quiet = quiet
-        config.max_workers = workers
 
         if not quiet:
             console.print(f"[bold blue]Gemini OCR[/bold blue] [dim]v{__version__}[/dim]")
             console.print(f"[dim]Model: {config.model}[/dim]\n")
 
         processor = OCRProcessor(config)
-        processor.process(
+        outcome = processor.process(
             input_path,
             output_path=output_dir,
             task=task,
@@ -202,8 +239,17 @@ def cli(
             reprocess=reprocess,
         )
 
-        if not quiet:
+        if quiet:
+            # Scripting contract: emit one output .md path per line on stdout.
+            for path in outcome.outputs:
+                click.echo(path)
+        else:
             console.print("\n[bold green]Done![/bold green]\n")
+
+        # Uniform exit policy (canon SYS-02): nonzero if any file/page failed,
+        # across both single-file and batch runs.
+        if outcome.exit_code != 0:
+            sys.exit(outcome.exit_code)
 
     except ValueError as e:
         console.print(f"\n[red]Error:[/red] {e}\n")
@@ -220,12 +266,18 @@ def cli(
         sys.exit(1)
 
 
-def _dry_run(input_path: Path) -> None:
-    """List files that would be processed without calling the API."""
+def _dry_run(input_path: Path, output_dir: Path | None = None) -> None:
+    """List files that would be processed without calling the API.
+
+    Discovery mirrors the real run: resolve the output root first and exclude it
+    so the dry run reports exactly what the real run would process (the same
+    output-root exclusion, no 'ocr'-name false positives).
+    """
     if input_path.is_file():
         files = [input_path]
     else:
-        files = get_supported_files(input_path)
+        output_root = resolve_output_root(input_path, output_dir)
+        files = get_supported_files(input_path, output_root)
 
     if not files:
         console.print("[yellow]No supported files found[/yellow]")

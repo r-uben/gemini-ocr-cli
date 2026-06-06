@@ -7,7 +7,6 @@ These tests are skipped if GEMINI_API_KEY is not set.
 
 import os
 import shutil
-from pathlib import Path
 
 import pytest
 
@@ -59,12 +58,13 @@ class TestIntegrationEndToEnd:
         assert result.success
 
         output_dir.mkdir()
-        output_path = real_processor.save_results(result, output_dir)
+        output_path = real_processor.save_results(result, output_dir, "sample.pdf")
 
         assert output_path.exists()
         content = output_path.read_text()
-        # Clean markdown — just the OCR text
-        assert result.text in content
+        # Clean markdown — page headers present, no frontmatter
+        assert "## Page 1" in content
+        assert not content.lstrip().startswith("---")
 
     def test_batch_processing(self, real_processor, sample_pdf, sample_image, tmp_path):
         input_dir = tmp_path / "input"

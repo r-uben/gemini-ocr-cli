@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Bumped the shared `ocr-output-contract` pin to `v0.1.3` and re-locked `uv.lock`
+  so a frozen install/CI exercises the same contract the engine is reviewed
+  against.
+
+### Fixed
+
+- **AUTO completeness oracle** (round-3 HIGH): the default `auto` path no longer
+  silently caches an incomplete native OCR as `completed`. Two data-loss modes
+  that escaped the tail-aware `is_truncated` now force the per-page fallback:
+  (1) a `STOP`-finish response cut mid-last-page, detected via a missing
+  end-of-document sentinel (the native prompt asks the model to emit a terminal
+  `<!-- OCR-END -->` line, which is stripped from the saved body); and (2) a
+  multi-page PDF whose response carries zero `## Page N` markers (markerless
+  collapse to one blob).
+- **Failure-record checksums** now use the contract's `failure_checksum`, so an
+  unreadable-input `status=failed` record carries the canonical schema-valid
+  `UNREADABLE_CHECKSUM` sentinel (`sha256:0…0`) instead of the non-conforming
+  `"sha256:unavailable"`. A later readable run gets a real digest and reprocesses.
+- **SYS-02**: an unreadable/race-deleted input no longer aborts the whole batch.
+  The directory pre-filter and single-file paths now checksum via the contract's
+  `safe_checksum`; a `None` result records a durable `status=failed` for that
+  file and the batch CONTINUES. The serial loop's `stat()` size print is also
+  moved inside per-file isolation.
+- **Idempotency fingerprint** now folds in the resolved output-affecting flags
+  (`pdf_mode`, `include_images`) via `run_fingerprint(extra=...)`, so a cross-mode
+  re-run (e.g. `--whole-pdf` then default `auto`, or `--no-images` then
+  `--include-images`) reprocesses instead of silently reusing the cached result.
+- **Auto-fallback** now uses the v0.1.2 tail-aware `is_truncated`: the recovered
+  physical `## Page N` marker numbers are passed in, so a legitimately-blank
+  interior page no longer false-triggers a full per-page re-OCR while a genuinely
+  dropped tail still does.
+- **Whole-PDF page identity**: `assemble_pages` is now given the recovered marker
+  numbers, so a model-skipped page is labeled by its source number instead of
+  being silently renumbered to 1..N under `--whole-pdf`.
+- **Files-API upload** now has a bounded poll deadline; an upload stuck in
+  `PROCESSING` raises (deleting the orphan) instead of hanging a worker forever,
+  so the per-file failure path records `status=failed`.
+
 ## [0.3.0] - 2026-03-11
 
 ### Changed

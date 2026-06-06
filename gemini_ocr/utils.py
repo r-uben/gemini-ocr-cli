@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
+from ocr_output_contract import iter_input_files, resolve_output_root
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +41,20 @@ def is_pdf_file(file_path: Path) -> bool:
     return file_path.suffix.lower() in SUPPORTED_DOCUMENTS
 
 
-def get_supported_files(directory: Path, recursive: bool = True) -> list[Path]:
-    """Get all supported files in a directory, excluding output directories."""
-    pattern = "**/*" if recursive else "*"
-    files = []
-    for file_path in directory.glob(pattern):
-        if (
-            file_path.is_file()
-            and is_supported_file(file_path)
-            and "gemini_ocr_output" not in file_path.parts
-        ):
-            files.append(file_path)
-    return sorted(files)
+def get_supported_files(directory: Path, output_root: Path) -> list[Path]:
+    """Get all supported input files under ``directory``, excluding outputs.
+
+    Delegates discovery to the shared contract's :func:`iter_input_files`, which
+    recurses ``directory`` and prunes anything at or under the RESOLVED
+    ``output_root`` (so the engine never re-ingests its own ``.md``/figure
+    outputs). Critically, the exclusion targets the *resolved output path* — never
+    a path component that merely happens to be named ``ocr`` — so inputs under a
+    user's own ``.../toolkits/ocr/...`` tree are still processed.
+
+    Callers MUST resolve the output root FIRST (via
+    :func:`ocr_output_contract.resolve_output_root`) and pass it in.
+    """
+    return list(iter_input_files(directory, output_root, SUPPORTED_EXTENSIONS))
 
 
 def sanitize_filename(filename: str, max_length: int | None = 200) -> str:
@@ -80,13 +83,13 @@ def determine_output_path(
     input_path: Path,
     output_path: Path | None = None,
 ) -> Path:
-    """Determine the output directory path."""
-    if output_path:
-        base_output = output_path
-    elif input_path.is_file():
-        base_output = input_path.parent / "gemini_ocr_output"
-    else:
-        base_output = input_path / "gemini_ocr_output"
+    """Determine and create the output root directory (canon: ``<parent>/ocr/``).
+
+    Thin wrapper over :func:`ocr_output_contract.resolve_output_root` that also
+    creates the directory. Output-shape logic lives in the shared contract
+    package; this helper exists for backward-compatible callers.
+    """
+    base_output = resolve_output_root(input_path, output_path)
     base_output.mkdir(parents=True, exist_ok=True)
     return base_output
 

@@ -37,6 +37,34 @@ class TestCLIBasics:
         assert "--dry-run" in result.output
         assert "--quiet" in result.output
         assert "--workers" in result.output
+        assert "--per-page" in result.output
+        assert "--whole-pdf" in result.output
+
+    def test_cli_mode_flags_route_to_config(self, runner, sample_pdf):
+        # --per-page / --whole-pdf set config.pdf_mode; neither leaves it untouched.
+        from gemini_ocr.processor import OCRProcessor
+
+        with (
+            patch.object(OCRProcessor, "__init__", return_value=None),
+            patch.object(OCRProcessor, "process", return_value=MagicMock(outputs=[], exit_code=0)),
+            patch("gemini_ocr.cli.Config") as mock_config_cls,
+        ):
+            cfg = MagicMock()
+            mock_config_cls.from_env.return_value = cfg
+            runner.invoke(cli, [str(sample_pdf), "--api-key", "k", "--per-page", "--quiet"])
+            assert cfg.pdf_mode == "per_page"
+
+            cfg2 = MagicMock()
+            mock_config_cls.from_env.return_value = cfg2
+            runner.invoke(cli, [str(sample_pdf), "--api-key", "k", "--whole-pdf", "--quiet"])
+            assert cfg2.pdf_mode == "whole_pdf"
+
+    def test_cli_mode_flags_mutually_exclusive(self, runner, sample_pdf):
+        result = runner.invoke(
+            cli, [str(sample_pdf), "--api-key", "k", "--per-page", "--whole-pdf"]
+        )
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
 
 
 class TestProcessCommand:
@@ -70,8 +98,9 @@ class TestDryRun:
 
     def test_dry_run_no_api_key_needed(self, runner, sample_pdf):
         with patch.dict(os.environ, {}, clear=True):
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+            env = {
+                k: v for k, v in os.environ.items() if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+            }
             with patch.dict(os.environ, env, clear=True):
                 result = runner.invoke(cli, [str(sample_pdf), "--dry-run"])
                 assert result.exit_code == 0
@@ -90,14 +119,16 @@ class TestInfoFlag:
             assert "Python" in result.output
 
     def test_info_shows_config(self, runner):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
-            with patch("google.genai.Client") as mock_client_class:
-                mock_client = MagicMock()
-                mock_client.models.list.return_value = []
-                mock_client_class.return_value = mock_client
-                result = runner.invoke(cli, ["--info", "."])
-                assert "Configuration" in result.output
-                assert "Model" in result.output
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+            patch("google.genai.Client") as mock_client_class,
+        ):
+            mock_client = MagicMock()
+            mock_client.models.list.return_value = []
+            mock_client_class.return_value = mock_client
+            result = runner.invoke(cli, ["--info", "."])
+            assert "Configuration" in result.output
+            assert "Model" in result.output
 
 
 class TestQuietMode:
@@ -107,7 +138,5 @@ class TestQuietMode:
         with patch("gemini_ocr.cli.OCRProcessor") as mock_processor:
             mock_instance = MagicMock()
             mock_processor.return_value = mock_instance
-            result = runner.invoke(
-                cli, [str(sample_pdf), "--api-key", "test-key", "--quiet"]
-            )
+            result = runner.invoke(cli, [str(sample_pdf), "--api-key", "test-key", "--quiet"])
             assert "Gemini OCR" not in result.output
