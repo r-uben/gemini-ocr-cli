@@ -51,6 +51,7 @@ from ocr_output_contract import (
     markdown_path_for,
     relative_key,
     resolve_output_root,
+    run_fingerprint,
     sha256_checksum,
     split_native_pages,
     utc_timestamp,
@@ -207,6 +208,10 @@ class OCRProcessor:
         self.client = genai.Client(api_key=config.api_key)
         self.model_name = config.model
         self._lock = threading.Lock()
+        #: Run-config fingerprint (model/backend/task/prompt) for the current
+        #: ``process()`` call. Stamped into every DocMetadata so re-runs under a
+        #: different model/mode/prompt invalidate the cache (see RootIndex.is_completed).
+        self._run_fingerprint: str | None = None
         logger.info(f"Initialized OCRProcessor with model: {config.model}")
 
     @staticmethod
@@ -325,6 +330,13 @@ class OCRProcessor:
             uploaded = self.client.files.get(name=uploaded.name)
 
         if uploaded.state == "FAILED":
+            # The upload created a remote object even though processing failed.
+            # Delete it here (the caller's finally never sees this orphan because
+            # _upload_file did not return it) so it does not linger 48h.
+            try:
+                self.client.files.delete(name=uploaded.name)
+            except Exception as del_err:
+                logger.debug(f"Failed to delete failed-upload remote file: {del_err}")
             raise RuntimeError(f"File upload failed: {uploaded.name}")
 
         if self.config.verbose:
@@ -453,21 +465,31 @@ class OCRProcessor:
         kept as one page so content is never silently dropped.
         """
         start_time = time.time()
-        self.config.validate_file_size(pdf_path)
 
-        # Actual page count is a truncation signal (recovered pages < real pages).
-        actual_pages = 0
-        try:
-            actual_pages = get_pdf_page_count(pdf_path)
-        except Exception as e:
-            logger.debug(f"Could not read page count for {pdf_path.name}: {e}")
-
-        # Native prompt: a custom prompt is honored verbatim; otherwise use the
-        # page-marker-augmented task prompt so a single call yields page markers.
-        prompt = custom_prompt or OCR_PROMPTS_NATIVE.get(task, OCR_PROMPTS_NATIVE["convert"])
+        # Native prompt: a single whole-PDF call MUST yield ``## Page N`` markers
+        # so the response can be split back into per-page sections. A custom
+        # prompt is honored but the page-marker instruction is still appended
+        # (otherwise the model returns one undivided blob and a multi-page PDF is
+        # silently recorded as ONE page); the task default is already augmented.
+        if custom_prompt is not None:
+            prompt = custom_prompt + _NATIVE_PAGE_MARKER_INSTRUCTION
+        else:
+            prompt = OCR_PROMPTS_NATIVE.get(task, OCR_PROMPTS_NATIVE["convert"])
 
         uploaded_file = None
         try:
+            # Size validation lives INSIDE the try so an oversized PDF returns a
+            # FAILED OCRResult (recorded status=failed) instead of raising out of
+            # the batch loop and aborting the run (canon SYS-02: durable failure).
+            self.config.validate_file_size(pdf_path)
+
+            # Actual page count is a truncation signal (recovered < real pages).
+            actual_pages = 0
+            try:
+                actual_pages = get_pdf_page_count(pdf_path)
+            except Exception as e:
+                logger.debug(f"Could not read page count for {pdf_path.name}: {e}")
+
             if show_progress and not self.config.quiet:
                 with Progress(
                     SpinnerColumn(),
@@ -564,9 +586,12 @@ class OCRProcessor:
         ``## Page N`` numbering stay aligned with the source PDF.
         """
         start_time = time.time()
-        self.config.validate_file_size(pdf_path)
 
         try:
+            # Size validation is INSIDE the try so an oversized PDF returns a
+            # FAILED OCRResult (recorded status=failed) rather than raising out of
+            # the batch loop and aborting the run (canon SYS-02: durable failure).
+            self.config.validate_file_size(pdf_path)
             doc = fitz.open(pdf_path)
         except Exception as e:
             logger.error(f"Error opening {pdf_path}: {e}")
@@ -752,9 +777,15 @@ class OCRProcessor:
                 )
             elif result.error:
                 error = result.error
+        try:
+            checksum = sha256_checksum(file_path)
+        except OSError:
+            # File unreadable (e.g. the failure was an I/O error). Still record
+            # the doc with a sentinel checksum so the failure is never lost.
+            checksum = "sha256:unavailable"
         return DocMetadata(
             status=status,
-            checksum=sha256_checksum(file_path),
+            checksum=checksum,
             model=self.model_name,
             backend=BACKEND,
             processing_time=result.processing_time,
@@ -762,6 +793,7 @@ class OCRProcessor:
             output_path=str(markdown_path.relative_to(output_root)),
             pages=result.page_count,
             error=error,
+            fingerprint=self._run_fingerprint,
             mode=result.mode,
             fell_back_from_whole_pdf=result.fell_back_from_whole_pdf,
         )
@@ -788,6 +820,35 @@ class OCRProcessor:
             index.record(rel_key, meta)
         return meta, markdown_path
 
+    def _persist_failure(
+        self,
+        error: str,
+        file_path: Path,
+        output_root: Path,
+        rel_key: str,
+        index: RootIndex,
+    ) -> DocMetadata:
+        """Persist durable ``status=failed`` metadata for a pre-OCRResult error.
+
+        Covers failures that occur BEFORE an :class:`OCRResult` could be built
+        (an oversized file slipping through, an unsupported type, or any
+        exception raised inside ``process_file`` / a worker future). Without this
+        the canon's SYS-02 promise ("every attempted file leaves a status=failed
+        record so 'which of my 500 PDFs failed?' is answerable") would be broken
+        for that whole class of failures. Mirrors a FAILED OCRResult through the
+        normal :meth:`_persist` path so both metadata levels stay in sync.
+
+        A checksum is recorded when the file is still readable; if even that
+        fails the doc is still recorded (sentinel checksum) so it is never lost.
+        """
+        synthesized = OCRResult(
+            file_path=file_path,
+            pages=[],
+            success=False,
+            error=error,
+        )
+        return self._persist(synthesized, file_path, output_root, rel_key, index)[0]
+
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
@@ -805,6 +866,12 @@ class OCRProcessor:
         The returned :class:`RunOutcome` carries the uniform exit policy: nonzero
         if any file or page failed, across both single-file and batch runs.
         """
+        # Stamp the run-config fingerprint so a re-run under a different
+        # model/backend/task/prompt invalidates the cache and reprocesses,
+        # instead of silently reusing output keyed only on the input checksum.
+        self._run_fingerprint = run_fingerprint(
+            self.model_name, BACKEND, task=task, prompt=custom_prompt
+        )
         if input_path.is_file():
             return self._process_single_file(
                 input_path, output_path, task, custom_prompt, reprocess
@@ -830,28 +897,39 @@ class OCRProcessor:
         rel_key = relative_key(file_path, scan_root)
         index = RootIndex(output_root)
 
-        if not reprocess and index.is_completed(rel_key, sha256_checksum(file_path)):
+        if not reprocess and index.is_completed(
+            rel_key, sha256_checksum(file_path), fingerprint=self._run_fingerprint
+        ):
             console.print(f"[yellow]Already processed:[/yellow] {file_path.name}")
             console.print("[dim]Use --reprocess to force reprocessing[/dim]")
-            outcome.add(Status.COMPLETED)
+            # Emit the cached output path so -q still prints it (scripting contract).
+            markdown_path = markdown_path_for(doc_dir_for(output_root, rel_key), rel_key)
+            outcome.add(Status.COMPLETED, output_path=str(markdown_path))
             return outcome
 
         console.print(f"[blue]Processing:[/blue] {file_path}")
         console.print(f"[blue]Output:[/blue] {output_root}\n")
 
-        result = self.process_file(file_path, task=task, custom_prompt=custom_prompt)
-        meta, markdown_path = self._persist(result, file_path, output_root, rel_key, index)
-        outcome.add(
-            meta.status,
-            detail=None if meta.status is Status.COMPLETED else rel_key,
-            output_path=str(markdown_path),
-        )
-
-        if meta.status is Status.COMPLETED:
-            console.print("\n[green]Success[/green]")
-            console.print(f"[dim]Time: {result.processing_time:.2f}s[/dim]")
-        else:
-            console.print(f"\n[red]Failed ({meta.status.value}):[/red] {meta.error}")
+        try:
+            result = self.process_file(file_path, task=task, custom_prompt=custom_prompt)
+            meta, markdown_path = self._persist(result, file_path, output_root, rel_key, index)
+            outcome.add(
+                meta.status,
+                detail=None if meta.status is Status.COMPLETED else rel_key,
+                output_path=str(markdown_path),
+            )
+            if meta.status is Status.COMPLETED:
+                console.print("\n[green]Success[/green]")
+                console.print(f"[dim]Time: {result.processing_time:.2f}s[/dim]")
+            else:
+                console.print(f"\n[red]Failed ({meta.status.value}):[/red] {meta.error}")
+        except Exception as e:
+            # Pre-OCRResult exception (or a _persist failure): record durable
+            # status=failed metadata rather than letting it abort the run.
+            logger.error(f"Error processing {rel_key}: {e}")
+            self._persist_failure(str(e), file_path, output_root, rel_key, index)
+            outcome.add(Status.FAILED, detail=rel_key)
+            console.print(f"\n[red]Failed:[/red] {e}")
         return outcome
 
     def _process_directory(
@@ -864,23 +942,32 @@ class OCRProcessor:
     ) -> RunOutcome:
         """Process all files in a directory, keyed on input-relative paths."""
         outcome = RunOutcome()
-        files = get_supported_files(dir_path)
+
+        # Resolve the output root FIRST so discovery can exclude it (a default
+        # root sits inside the scanned tree as <input>/ocr/; without this the
+        # engine would re-ingest its own .md/figure outputs on a re-run).
+        output_root = resolve_output_root(dir_path, output_path)
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        files = get_supported_files(dir_path, output_root)
         if not files:
             console.print("[yellow]No supported files found[/yellow]")
             return outcome
 
-        output_root = resolve_output_root(dir_path, output_path)
-        output_root.mkdir(parents=True, exist_ok=True)
         index = RootIndex(output_root)
 
         # Filter already-processed files (keyed by input-relative path).
         files_to_process: list[tuple[Path, str]] = []
         for f in files:
             rel_key = relative_key(f, dir_path)
-            if not reprocess and index.is_completed(rel_key, sha256_checksum(f)):
+            if not reprocess and index.is_completed(
+                rel_key, sha256_checksum(f), fingerprint=self._run_fingerprint
+            ):
                 if self.config.verbose:
                     console.print(f"[dim]Skipping: {rel_key}[/dim]")
-                outcome.add(Status.COMPLETED)
+                # Emit the cached path so -q still lists it (scripting contract).
+                markdown_path = markdown_path_for(doc_dir_for(output_root, rel_key), rel_key)
+                outcome.add(Status.COMPLETED, output_path=str(markdown_path))
             else:
                 files_to_process.append((f, rel_key))
 
@@ -902,19 +989,30 @@ class OCRProcessor:
             for file_path, rel_key in files_to_process:
                 file_size = format_file_size(file_path.stat().st_size)
                 console.print(f"[cyan]{rel_key}[/cyan] ({file_size})")
-                result = self.process_file(
-                    file_path, task=task, custom_prompt=custom_prompt, show_progress=False
-                )
-                meta, markdown_path = self._persist(result, file_path, output_root, rel_key, index)
-                outcome.add(
-                    meta.status,
-                    detail=None if meta.status is Status.COMPLETED else rel_key,
-                    output_path=str(markdown_path),
-                )
-                if meta.status is Status.COMPLETED:
-                    console.print(f"  [green]OK[/green] ({result.processing_time:.1f}s)\n")
-                else:
-                    console.print(f"  [red]{meta.status.value.upper()}: {meta.error}[/red]\n")
+                # Each file is isolated: a pre-OCRResult exception (oversized file,
+                # unsupported type, _persist error) is recorded as status=failed and
+                # the loop CONTINUES so one bad file never aborts the batch.
+                try:
+                    result = self.process_file(
+                        file_path, task=task, custom_prompt=custom_prompt, show_progress=False
+                    )
+                    meta, _ = self._persist(result, file_path, output_root, rel_key, index)
+                    outcome.add(
+                        meta.status,
+                        detail=None if meta.status is Status.COMPLETED else rel_key,
+                        output_path=str(
+                            markdown_path_for(doc_dir_for(output_root, rel_key), rel_key)
+                        ),
+                    )
+                    if meta.status is Status.COMPLETED:
+                        console.print(f"  [green]OK[/green] ({result.processing_time:.1f}s)\n")
+                    else:
+                        console.print(f"  [red]{meta.status.value.upper()}: {meta.error}[/red]\n")
+                except Exception as e:
+                    logger.error(f"Error processing {rel_key}: {e}")
+                    self._persist_failure(str(e), file_path, output_root, rel_key, index)
+                    outcome.add(Status.FAILED, detail=rel_key)
+                    console.print(f"  [red]ERROR: {e}[/red]\n")
 
         total_time = time.time() - start_time
         console.print(
@@ -976,8 +1074,17 @@ class OCRProcessor:
                                 f"  [red]{meta.status.value.upper()}[/red] {rel_key}: {meta.error}"
                             )
                     except Exception as e:
-                        # Catastrophic failure (could not even build a result).
+                        # Pre-OCRResult failure (the worker raised, or _persist
+                        # itself failed): persist durable status=failed metadata so
+                        # the doc is not silently dropped (canon SYS-02), matching
+                        # the serial path's behavior. _persist_failure is best-effort.
                         console.print(f"  [red]ERROR[/red] {rel_key}: {e}")
+                        try:
+                            self._persist_failure(str(e), file_path, output_root, rel_key, index)
+                        except Exception as persist_err:
+                            logger.error(
+                                f"Failed to persist failure metadata for {rel_key}: {persist_err}"
+                            )
                         outcome.add(Status.FAILED, detail=rel_key)
 
                     progress.advance(progress_task)
