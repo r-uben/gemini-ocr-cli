@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import click
+from ocr_output_contract import resolve_output_root
 from rich.console import Console
 from rich.table import Table
 
@@ -193,7 +194,7 @@ def cli(
 
     # Handle --dry-run (no API key needed)
     if dry_run:
-        _dry_run(input_path)
+        _dry_run(input_path, output_dir)
         return
 
     try:
@@ -265,12 +266,18 @@ def cli(
         sys.exit(1)
 
 
-def _dry_run(input_path: Path) -> None:
-    """List files that would be processed without calling the API."""
+def _dry_run(input_path: Path, output_dir: Path | None = None) -> None:
+    """List files that would be processed without calling the API.
+
+    Discovery mirrors the real run: resolve the output root first and exclude it
+    so the dry run reports exactly what the real run would process (the same
+    output-root exclusion, no 'ocr'-name false positives).
+    """
     if input_path.is_file():
         files = [input_path]
     else:
-        files = get_supported_files(input_path)
+        output_root = resolve_output_root(input_path, output_dir)
+        files = get_supported_files(input_path, output_root)
 
     if not files:
         console.print("[yellow]No supported files found[/yellow]")

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
-from ocr_output_contract import DEFAULT_OUTPUT_DIRNAME, resolve_output_root
+from ocr_output_contract import iter_input_files, resolve_output_root
 
 logger = logging.getLogger(__name__)
 
@@ -41,18 +41,20 @@ def is_pdf_file(file_path: Path) -> bool:
     return file_path.suffix.lower() in SUPPORTED_DOCUMENTS
 
 
-def get_supported_files(directory: Path, recursive: bool = True) -> list[Path]:
-    """Get all supported files in a directory, excluding the output directory."""
-    pattern = "**/*" if recursive else "*"
-    files = []
-    for file_path in directory.glob(pattern):
-        if (
-            file_path.is_file()
-            and is_supported_file(file_path)
-            and DEFAULT_OUTPUT_DIRNAME not in file_path.parts
-        ):
-            files.append(file_path)
-    return sorted(files)
+def get_supported_files(directory: Path, output_root: Path) -> list[Path]:
+    """Get all supported input files under ``directory``, excluding outputs.
+
+    Delegates discovery to the shared contract's :func:`iter_input_files`, which
+    recurses ``directory`` and prunes anything at or under the RESOLVED
+    ``output_root`` (so the engine never re-ingests its own ``.md``/figure
+    outputs). Critically, the exclusion targets the *resolved output path* — never
+    a path component that merely happens to be named ``ocr`` — so inputs under a
+    user's own ``.../toolkits/ocr/...`` tree are still processed.
+
+    Callers MUST resolve the output root FIRST (via
+    :func:`ocr_output_contract.resolve_output_root`) and pass it in.
+    """
+    return list(iter_input_files(directory, output_root, SUPPORTED_EXTENSIONS))
 
 
 def sanitize_filename(filename: str, max_length: int | None = 200) -> str:
