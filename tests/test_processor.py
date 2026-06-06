@@ -5,7 +5,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from PIL import Image
 
 from gemini_ocr.config import Config
 from gemini_ocr.processor import OCRProcessor, OCRResult
@@ -72,7 +71,7 @@ class TestOCRProcessor:
         assert "Extracted text" in result.text
 
     def test_process_image_with_custom_prompt(self, processor, sample_image):
-        result = processor.process_image(sample_image, custom_prompt="Extract only numbers")
+        processor.process_image(sample_image, custom_prompt="Extract only numbers")
         assert processor.client.models.generate_content.called
 
     def test_process_pdf(self, processor, sample_pdf):
@@ -170,6 +169,32 @@ class TestOCRProcessorNative:
         # No fallback in forced whole_pdf mode: a single whole-PDF call only.
         assert processor.client.models.generate_content.call_count == 1
 
+    def test_custom_prompt_native_still_enforces_page_markers(self, processor, sample_pdf):
+        # MEDIUM fix: a custom --prompt in the native path must still carry the
+        # ## Page N boundary instruction, so a multi-page PDF is NOT recorded as
+        # one page. Capture the prompt the model received and assert the marker
+        # instruction was appended.
+        from tests.conftest import make_gemini_response
+
+        seen = {}
+
+        def gen(*args, **kwargs):
+            # contents = [prompt, *parts]; prompt is the first positional content.
+            contents = kwargs.get("contents") or (args[0] if args else None)
+            if contents:
+                seen["prompt"] = contents[0]
+            return make_gemini_response("## Page 1\n\nP1\n\n## Page 2\n\nP2")
+
+        processor.client.models.generate_content.side_effect = gen
+        result = processor.process_pdf(
+            sample_pdf, show_progress=False, mode="whole_pdf", custom_prompt="My custom prompt"
+        )
+        assert "My custom prompt" in seen["prompt"]
+        assert "## Page N" in seen["prompt"]
+        # The 2-page PDF is recovered as 2 pages, not silently collapsed to 1.
+        assert result.page_count == 2
+        assert result.mode == "whole_pdf"
+
     def test_native_empty_response_is_failure(self, processor, sample_pdf):
         # An empty extraction raises in _extract_text -> caught -> FAILED.
         processor.client.models.generate_content.side_effect = RuntimeError(
@@ -180,6 +205,20 @@ class TestOCRProcessorNative:
         assert result.page_count == 0
         assert result.status.value == "failed"
         assert result.mode == "whole_pdf"
+
+    def test_upload_failed_state_deletes_orphan_remote_file(self, processor, sample_pdf):
+        # MEDIUM fix: when the Files-API upload ends in FAILED state, the remote
+        # object it created must be deleted (the caller's finally never sees it
+        # because _upload_file did not return it).
+        failed_file = MagicMock()
+        failed_file.name = "files/orphan-id"
+        failed_file.state = "FAILED"
+        processor.client.files.upload.return_value = failed_file
+
+        result = processor.process_pdf(sample_pdf, show_progress=False, mode="whole_pdf")
+        assert not result.success
+        # The orphan remote file was deleted exactly once, by name.
+        processor.client.files.delete.assert_any_call(name="files/orphan-id")
 
     def test_uses_per_page_when_config_mode_set(self, mock_config, mock_genai_client, sample_pdf):
         # config.pdf_mode="per_page" must route process_pdf to the per-page path.
@@ -339,8 +378,10 @@ class TestOCRProcessorSaveResults:
         output_dir.mkdir()
         output_path = processor.save_results(result, output_dir, "sample.png")
 
-        # Should be in per-document folder mirroring the relative key
-        assert output_path.parent.name == "sample"
+        # Per-document folder mirroring the relative key. v0.1.1 disambiguates
+        # non-PDF inputs as <stem>_<ext> so a/foo.pdf and a/foo.png never collide;
+        # the .md keeps the clean stem name.
+        assert output_path.parent.name == "sample_png"
         assert output_path.name == "sample.md"
         assert output_path.exists()
 
@@ -422,9 +463,31 @@ class TestOCRProcessorErrorHandling:
         assert result.success is False
         assert result.error is not None
 
-    def test_file_size_validation(self, processor, mock_config, tmp_path):
+    def test_file_size_validation_pdf_returns_failed_not_raises(
+        self, processor, mock_config, tmp_path
+    ):
+        # An oversized PDF must NOT raise out of process_file (which would abort a
+        # batch); it returns a FAILED OCRResult so the failure is recorded as
+        # status=failed and the batch continues (canon SYS-02). Validation now
+        # lives INSIDE the try in both PDF paths.
         mock_config.max_file_size_mb = 0.0001
         large_file = tmp_path / "large.pdf"
         large_file.write_bytes(b"x" * 10000)
-        with pytest.raises(ValueError, match="exceeds maximum"):
-            processor.process_file(large_file)
+
+        result = processor.process_file(large_file)
+        assert result.success is False
+        assert result.status.value == "failed"
+        assert "exceeds maximum" in (result.error or "")
+
+    def test_file_size_validation_image_returns_failed(self, processor, mock_config, tmp_path):
+        # Images already validated inside their try; assert the same FAILED result.
+        mock_config.max_file_size_mb = 0.0001
+        large_img = tmp_path / "large.png"
+        from PIL import Image as _Image
+
+        _Image.new("RGB", (200, 200), "white").save(large_img)
+
+        result = processor.process_file(large_img)
+        assert result.success is False
+        assert result.status.value == "failed"
+        assert "exceeds maximum" in (result.error or "")

@@ -119,14 +119,16 @@ class TestInfoFlag:
             assert "Python" in result.output
 
     def test_info_shows_config(self, runner):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
-            with patch("google.genai.Client") as mock_client_class:
-                mock_client = MagicMock()
-                mock_client.models.list.return_value = []
-                mock_client_class.return_value = mock_client
-                result = runner.invoke(cli, ["--info", "."])
-                assert "Configuration" in result.output
-                assert "Model" in result.output
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+            patch("google.genai.Client") as mock_client_class,
+        ):
+            mock_client = MagicMock()
+            mock_client.models.list.return_value = []
+            mock_client_class.return_value = mock_client
+            result = runner.invoke(cli, ["--info", "."])
+            assert "Configuration" in result.output
+            assert "Model" in result.output
 
 
 class TestQuietMode:

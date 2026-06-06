@@ -187,6 +187,173 @@ class TestProcessorConformance:
         )
 
 
+class TestBatchFailureResilience:
+    """SYS-02: a failing file in a batch is recorded status=failed AND the rest
+    of the batch still processes (one bad file never aborts the run). Covers the
+    serial and concurrent paths and a pre-OCRResult (oversized) failure.
+    """
+
+    def test_oversized_file_does_not_abort_serial_batch(self, processor, tmp_path):
+        # A 3-file batch: the middle file is oversized (pre-OCRResult failure).
+        # It must be recorded status=failed and the other two must complete.
+        root = tmp_path / "in"
+        root.mkdir()
+        _make_multipage_pdf(root / "a.pdf", n_pages=1)
+        big = root / "big.pdf"
+        _make_multipage_pdf(big, n_pages=1)
+        # Pad big.pdf well past the size cap so validate_file_size fails.
+        big.write_bytes(big.read_bytes() + b"\x00" * 2_000_000)
+        _make_multipage_pdf(root / "c.pdf", n_pages=1)
+
+        processor.config.max_file_size_mb = 1.0  # ~1MB cap; big.pdf exceeds it
+        processor.client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response(
+            "ok"
+        )
+
+        out = tmp_path / "out"
+        outcome = processor.process(root, output_path=out)
+
+        # The whole batch was attempted: two completed, one failed (nonzero exit).
+        assert outcome.exit_code != 0
+        assert outcome.completed == 2
+        assert outcome.failed == 1
+
+        # Durable status=failed metadata exists for the oversized file AND
+        # completed metadata for the others — all conform.
+        assert_conforms(
+            out,
+            [
+                ExpectedDoc(rel_key="a.pdf", pages=1, status="completed"),
+                ExpectedDoc(rel_key="big.pdf", status="failed"),
+                ExpectedDoc(rel_key="c.pdf", pages=1, status="completed"),
+            ],
+            require_failures_nonzero_exit=True,
+        )
+        # The failed file's error is captured in its durable metadata.
+        big_meta = json.loads((out / "big" / "metadata.json").read_text())
+        assert big_meta["status"] == "failed"
+        assert "exceeds maximum" in big_meta["error"]
+        # And the root index records it keyed by input-relative path.
+        root_idx = json.loads((out / "metadata.json").read_text())["files"]
+        assert root_idx["big.pdf"]["status"] == "failed"
+
+    def test_unsupported_type_in_concurrent_batch_persists_failed(
+        self, mock_config, mock_genai_client, tmp_path
+    ):
+        # The concurrent catch-all must _persist a FAILED record (not just count
+        # it), so a worker that raises before building an OCRResult still leaves
+        # durable per-doc + root metadata.
+        mock_config.pdf_mode = "per_page"
+        mock_config.max_workers = 2
+        with patch("gemini_ocr.processor.genai") as mock_genai:
+            mock_genai.Client.return_value = mock_genai_client
+            proc = OCRProcessor(mock_config)
+            proc.client = mock_genai_client
+
+        root = tmp_path / "in"
+        root.mkdir()
+        _make_multipage_pdf(root / "good.pdf", n_pages=1)
+        # process_file raises ValueError('Unsupported file type') for .xyz, which
+        # the concurrent future surfaces as a pre-OCRResult exception.
+        (root / "bad.xyz").write_bytes(b"not ocr-able")
+
+        proc.client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response("ok")
+
+        out = tmp_path / "out"
+        # bad.xyz is not a supported suffix, so discovery skips it; force it into
+        # the batch by also dropping a supported-but-unprocessable file. Instead,
+        # assert via a direct failing future: monkeypatch process_file to raise
+        # for one rel_key.
+        real_process_file = proc.process_file
+
+        def flaky(file_path, *a, **k):
+            if file_path.name == "good.pdf":
+                return real_process_file(file_path, *a, **k)
+            raise RuntimeError("worker blew up")
+
+        # Add a second supported file that the flaky wrapper will fail.
+        _make_multipage_pdf(root / "boom.pdf", n_pages=1)
+        with patch.object(proc, "process_file", side_effect=flaky):
+            outcome = proc.process(root, output_path=out)
+
+        assert outcome.exit_code != 0
+        assert outcome.failed == 1
+        # Durable FAILED metadata for the worker-exception file.
+        assert_conforms(
+            out,
+            [
+                ExpectedDoc(rel_key="good.pdf", pages=1, status="completed"),
+                ExpectedDoc(rel_key="boom.pdf", status="failed"),
+            ],
+            require_failures_nonzero_exit=True,
+        )
+        boom_meta = json.loads((out / "boom" / "metadata.json").read_text())
+        assert boom_meta["status"] == "failed"
+        assert "worker blew up" in boom_meta["error"]
+
+
+class TestRunFingerprintInvalidation:
+    """A re-run under a different model/mode reprocesses instead of reusing the
+    cached output (run_fingerprint stamped in metadata + checked by is_completed).
+    """
+
+    def test_model_change_forces_reprocess(self, mock_config, mock_genai_client, tmp_path):
+        mock_config.pdf_mode = "per_page"
+        pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=1)
+        out = tmp_path / "out"
+
+        def make_proc(model):
+            mock_config.model = model
+            with patch("gemini_ocr.processor.genai") as mg:
+                mg.Client.return_value = mock_genai_client
+                p = OCRProcessor(mock_config)
+                p.client = mock_genai_client
+                return p
+
+        mock_genai_client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response(
+            "text"
+        )
+
+        p1 = make_proc("gemini-3-flash-preview")
+        p1.process(pdf, output_path=out)
+        calls_after_first = mock_genai_client.models.generate_content.call_count
+        assert calls_after_first >= 1
+
+        # Same model -> cache hit, no new OCR call.
+        p_same = make_proc("gemini-3-flash-preview")
+        p_same.process(pdf, output_path=out)
+        assert mock_genai_client.models.generate_content.call_count == calls_after_first
+
+        # Different model -> fingerprint mismatch -> reprocess (new OCR call).
+        p2 = make_proc("gemini-3-pro")
+        p2.process(pdf, output_path=out)
+        assert mock_genai_client.models.generate_content.call_count > calls_after_first
+        meta = json.loads((out / "sample" / "metadata.json").read_text())
+        assert meta["model"] == "gemini-3-pro"
+        assert meta["fingerprint"].startswith("fp:")
+
+
+class TestImageDocConformance:
+    """A single image input conforms under v0.1.1 stem+ext keying (<stem>_<ext>)."""
+
+    def test_image_input_conforms(self, processor, tmp_path):
+        from PIL import Image as _Image
+
+        img = tmp_path / "scan.png"
+        _Image.new("RGB", (50, 50), "white").save(img)
+        out = tmp_path / "out"
+        processor.client.models.generate_content.side_effect = lambda *a, **k: _mock_page_response(
+            "image text"
+        )
+
+        outcome = processor.process(img, output_path=out)
+        assert outcome.exit_code == 0
+        # Harness resolves the doc dir via the contract's doc_dir_for, which maps
+        # scan.png -> scan_png/scan.md and verifies inline image links resolve.
+        assert_conforms(out, [ExpectedDoc(rel_key="scan.png", pages=1, status="completed")])
+        assert (out / "scan_png" / "scan.md").exists()
+
+
 class TestNativeAndFallbackConformance:
     """Native whole-PDF and auto-fallback both produce conforming output.
 

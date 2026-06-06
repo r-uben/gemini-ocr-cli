@@ -7,7 +7,6 @@ These tests are skipped if GEMINI_API_KEY is not set.
 
 import os
 import shutil
-from pathlib import Path
 
 import pytest
 
