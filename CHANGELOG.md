@@ -9,12 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bumped the shared `ocr-output-contract` pin to `v0.1.2` and re-locked `uv.lock`
+- Bumped the shared `ocr-output-contract` pin to `v0.1.3` and re-locked `uv.lock`
   so a frozen install/CI exercises the same contract the engine is reviewed
-  against (was drifting: lock pinned v0.1.0, pyproject claimed v0.1.1).
+  against.
 
 ### Fixed
 
+- **AUTO completeness oracle** (round-3 HIGH): the default `auto` path no longer
+  silently caches an incomplete native OCR as `completed`. Two data-loss modes
+  that escaped the tail-aware `is_truncated` now force the per-page fallback:
+  (1) a `STOP`-finish response cut mid-last-page, detected via a missing
+  end-of-document sentinel (the native prompt asks the model to emit a terminal
+  `<!-- OCR-END -->` line, which is stripped from the saved body); and (2) a
+  multi-page PDF whose response carries zero `## Page N` markers (markerless
+  collapse to one blob).
+- **Failure-record checksums** now use the contract's `failure_checksum`, so an
+  unreadable-input `status=failed` record carries the canonical schema-valid
+  `UNREADABLE_CHECKSUM` sentinel (`sha256:0…0`) instead of the non-conforming
+  `"sha256:unavailable"`. A later readable run gets a real digest and reprocesses.
 - **SYS-02**: an unreadable/race-deleted input no longer aborts the whole batch.
   The directory pre-filter and single-file paths now checksum via the contract's
   `safe_checksum`; a `None` result records a durable `status=failed` for that

@@ -127,10 +127,15 @@ together with whether an auto run fell back (`fell_back_from_whole_pdf`):
   one-line note printed and the fallback recorded in metadata
   (`mode: "per_page"`, `fell_back_from_whole_pdf: true`). Truncation is detected
   from real signals, with no hardcoded page-count threshold: (a) a length-limited
-  finish reason (`MAX_TOKENS` / `LENGTH`), or (b) fewer `## Page N` markers
-  recovered than the PDF's actual page count (PyMuPDF). This is the
-  cost/quality-preferred default for academic PDFs: one call per document, full
-  document context, but no silently truncated tails on long papers.
+  finish reason (`MAX_TOKENS` / `LENGTH`); (b) fewer `## Page N` markers recovered
+  than the PDF's actual page count (PyMuPDF, i.e. a dropped *tail*); (c) a missing
+  end-of-document completeness sentinel (the model is asked to emit a terminal
+  `<!-- OCR-END -->` line; its absence means the body was cut mid-page even on a
+  clean `STOP`, and the sentinel is stripped from the saved markdown); or (d) a
+  multi-page PDF whose response carries **zero** `## Page N` markers (markerless
+  collapse to a single blob). This is the cost/quality-preferred default for
+  academic PDFs: one call per document, full document context, but no silently
+  truncated tails on long papers.
 - **`--per-page`.** Forces page-by-page OCR: each page is rendered to an image and
   OCR'd in its own call (N calls per document). Honest per-page failure tracking
   (one page can fail without sinking the document) at higher cost.

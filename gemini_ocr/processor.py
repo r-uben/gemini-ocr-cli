@@ -45,6 +45,7 @@ from ocr_output_contract import (
     Status,
     assemble_pages,
     doc_dir_for,
+    failure_checksum,
     figure_filename,
     figure_markdown_link,
     figures_dir_for,
@@ -104,16 +105,38 @@ Provide a structured description.""",
 Preserve all data, headers, and structure. Output only the markdown tables.""",
 }
 
+#: End-of-document sentinel the model is asked to emit as the FINAL line of a
+#: native whole-PDF response, AFTER the last page's body. It is the completeness
+#: signal for the AUTO default: a response that finishes with ``STOP`` but whose
+#: body was cut mid-last-page will NOT carry this trailing marker, so its ABSENCE
+#: is treated as truncation and triggers the per-page fallback (see the
+#: completeness oracle in :meth:`_process_pdf_native`). It is an HTML comment so,
+#: on the rare path where it survives into saved output, it renders as nothing; we
+#: strip it from the body before splitting regardless (see
+#: :func:`_strip_end_sentinel`).
+_OCR_END_SENTINEL = "<!-- OCR-END -->"
+
+#: Matches the end-of-document sentinel anywhere it appears, tolerant of
+#: surrounding whitespace. Used both to detect completeness and to strip the
+#: sentinel from the body so it never leaks into the saved markdown.
+_OCR_END_SENTINEL_RE = re.compile(r"[ \t]*<!--\s*OCR-END\s*-->[ \t]*", re.IGNORECASE)
+
 #: Instruction appended to native whole-PDF prompts so the single returned blob
 #: carries explicit per-page boundaries we can split on. The model is asked to
 #: begin EACH source page with a ``## Page N`` header (1-indexed, matching the
-#: PDF's own page order), which we then parse back into per-page sections.
+#: PDF's own page order), which we then parse back into per-page sections, AND to
+#: emit a terminal completeness sentinel after the last page. The sentinel's
+#: absence signals a cut-off (STOP-with-truncated-tail) response and drives the
+#: AUTO fallback; we strip it from the saved body.
 _NATIVE_PAGE_MARKER_INSTRUCTION = (
     "\n\nThis is a multi-page PDF. Process EVERY page, in order. Begin the "
     "transcription of each source page with a level-2 markdown header of the "
     'exact form "## Page N" on its own line, where N is the 1-indexed page '
     "number (## Page 1 for the first page, ## Page 2 for the second, and so on). "
-    "Do not skip, merge, or renumber pages. Output only the resulting markdown."
+    "Do not skip, merge, or renumber pages. After you have transcribed the LAST "
+    f'page in full, emit the exact line "{_OCR_END_SENTINEL}" on its own line as '
+    "the very last line of your output, to signal the document is complete. "
+    "Output only the resulting markdown."
 )
 
 # OCR prompts for the native whole-PDF path. Identical to the per-page prompts but
@@ -173,6 +196,20 @@ def _recover_page_numbers(text: str) -> list[int]:
     labeled ``## Page 1`` as before.
     """
     return [int(m.group(1)) for m in PAGE_MARKER_RE.finditer(text or "")]
+
+
+def _has_end_sentinel(text: str) -> bool:
+    """True if the native response carries the end-of-document sentinel."""
+    return _OCR_END_SENTINEL_RE.search(text or "") is not None
+
+
+def _strip_end_sentinel(text: str) -> str:
+    """Remove the end-of-document sentinel (and its line) from a native blob.
+
+    Called BEFORE splitting/saving so the completeness marker never leaks into
+    the persisted markdown body. Tolerant of surrounding whitespace and casing.
+    """
+    return _OCR_END_SENTINEL_RE.sub("", text or "")
 
 
 @dataclass
@@ -553,6 +590,13 @@ class OCRProcessor:
                 uploaded_file = self._upload_file(pdf_path)
                 text, finish_reason = self._call_with_retry_detailed([uploaded_file], prompt)
 
+            # Completeness sentinel: the model is asked to emit a terminal
+            # ``<!-- OCR-END -->`` line after the LAST page. Capture its presence
+            # from the RAW response, then strip it so it never leaks into the
+            # saved markdown body (split/assemble operate on sentinel-free text).
+            has_sentinel = _has_end_sentinel(text)
+            text = _strip_end_sentinel(text)
+
             pages = split_native_pages(text)
             if not pages:
                 # Empty document output is a failure per the contract.
@@ -575,22 +619,43 @@ class OCRProcessor:
             # labeling rather than risking a misaligned page_numbers list.
             recovered_page_numbers = recovered if len(recovered) == len(pages) else None
 
-            # Auto-fallback: a truncated whole-PDF response means the TAIL of the
-            # document was dropped. The v0.1.2 contract infers this from the
-            # recovered marker numbers (max recovered < actual_pages), so a blank
-            # interior page no longer false-triggers a full per-page re-OCR while a
-            # genuinely dropped tail still does. Redo page-by-page and use that.
-            if allow_fallback and is_truncated(
+            # AUTO completeness oracle (the residual HIGH this PR closes). The
+            # contract's tail-aware ``is_truncated`` catches the length-limited
+            # finish reason and the dropped-tail-WITH-marker-shortfall case, but
+            # silently accepts two genuine data-loss modes the contract docstring
+            # explicitly defers to an upstream sentinel:
+            #   1. STOP-with-cut-last-page: the model finishes (STOP) but the body
+            #      was cut mid-last-page; ``max(recovered) == actual_pages`` so the
+            #      page signal stays silent. The model never reaches the terminal
+            #      sentinel, so its ABSENCE flags this as truncation.
+            #   2. Markerless multi-page collapse: a multi-page PDF (actual_pages>1)
+            #      whose response carries ZERO ``## Page N`` markers collapses to a
+            #      single ``## Page 1`` blob. Recovered is empty, the page signal is
+            #      disabled, and ``is_truncated`` returns False -- so we must treat
+            #      a markerless multi-page response as truncation directly.
+            markerless_multipage = actual_pages > 1 and len(recovered) == 0
+            sentinel_missing = not has_sentinel
+            completeness_truncated = sentinel_missing or markerless_multipage
+
+            # Auto-fallback: a truncated whole-PDF response means content (usually
+            # the TAIL) was dropped. ``is_truncated`` catches length-limited /
+            # dropped-tail; the completeness oracle above catches STOP-with-cut-
+            # tail and markerless collapse. Either fires the per-page re-OCR.
+            contract_truncated = is_truncated(
                 finish_reason,
                 len(pages),
                 actual_pages,
                 recovered_page_numbers=recovered_page_numbers,
-            ):
-                reason = (
-                    "length-limited finish reason"
-                    if _finish_reason_is_length_limited(finish_reason)
-                    else f"recovered {len(pages)} of {actual_pages} page(s)"
-                )
+            )
+            if allow_fallback and (contract_truncated or completeness_truncated):
+                if _finish_reason_is_length_limited(finish_reason):
+                    reason = "length-limited finish reason"
+                elif markerless_multipage:
+                    reason = f"no per-page markers for a {actual_pages}-page PDF"
+                elif sentinel_missing:
+                    reason = "missing end-of-document sentinel (tail likely cut)"
+                else:
+                    reason = f"recovered {len(pages)} of {actual_pages} page(s)"
                 if not self.config.quiet:
                     console.print(
                         f"[yellow]Whole-PDF output truncated ({reason}); "
@@ -852,12 +917,16 @@ class OCRProcessor:
                 )
             elif result.error:
                 error = result.error
-        try:
+        if status is Status.COMPLETED:
+            # A completed doc was definitely readable; record its real digest.
             checksum = sha256_checksum(file_path)
-        except OSError:
-            # File unreadable (e.g. the failure was an I/O error). Still record
-            # the doc with a sentinel checksum so the failure is never lost.
-            checksum = "sha256:unavailable"
+        else:
+            # Failure/partial record: the input may be unreadable (the failure
+            # WAS an I/O error). Use the contract's failure_checksum so the entry
+            # still carries a schema-valid ``sha256:`` checksum -- the real digest
+            # if readable, else the canonical UNREADABLE_CHECKSUM sentinel --
+            # instead of the old non-conforming "sha256:unavailable" / None / "".
+            checksum = failure_checksum(file_path)
         return DocMetadata(
             status=status,
             checksum=checksum,

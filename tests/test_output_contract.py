@@ -364,9 +364,11 @@ class TestNativeAndFallbackConformance:
     def test_native_whole_pdf_conforms(self, native_processor, tmp_path):
         pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=3)
         out = tmp_path / "out"
-        # One complete whole-PDF call: 3 page markers, STOP finish.
+        # One complete whole-PDF call: 3 page markers, STOP finish, terminal
+        # completeness sentinel (so the AUTO oracle accepts it without fallback).
         native_processor.client.models.generate_content.return_value = _mock_page_response(
             "## Page 1\n\nP1 text\n\n## Page 2\n\nP2 text\n\n## Page 3\n\nP3 text"
+            "\n\n<!-- OCR-END -->"
         )
 
         outcome = native_processor.process(pdf, output_path=out)
@@ -377,6 +379,8 @@ class TestNativeAndFallbackConformance:
         assert_conforms(out, [ExpectedDoc(rel_key="sample.pdf", pages=3, status="completed")])
         body = (out / "sample" / "sample.md").read_text()
         assert "P1 text" in body and "P3 text" in body
+        # The completeness sentinel never leaks into the saved body.
+        assert "OCR-END" not in body
 
         doc_meta = json.loads((out / "sample" / "metadata.json").read_text())
         assert doc_meta["mode"] == "whole_pdf"
@@ -488,6 +492,17 @@ class TestUnreadableInputBatchResilience:
             meta = json.loads((out / "lonely" / "metadata.json").read_text())
             assert meta["status"] == "failed"
             assert "unreadable" in meta["error"].lower()
+            # v0.1.3: an unreadable-input failure record must carry a schema-valid
+            # ``sha256:`` checksum (the UNREADABLE_CHECKSUM sentinel), NOT
+            # None/""/the old "sha256:unavailable". Both metadata levels agree.
+            from ocr_output_contract import UNREADABLE_CHECKSUM
+
+            assert meta["checksum"] == UNREADABLE_CHECKSUM
+            assert meta["checksum"].startswith("sha256:")
+            root_entry = json.loads((out / "metadata.json").read_text())["files"]["lonely.pdf"]
+            assert root_entry["checksum"] == UNREADABLE_CHECKSUM
+            # The failure record must satisfy the contract's own harness.
+            assert_conforms(out, [ExpectedDoc(rel_key="lonely.pdf", status="failed")])
         finally:
             os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)
 
@@ -502,10 +517,13 @@ class TestBlankInteriorPageNoNeedlessFallback:
     def test_blank_interior_page_keeps_whole_pdf_no_fallback(self, native_processor, tmp_path):
         pdf = _make_multipage_pdf(tmp_path / "sample.pdf", n_pages=3)
         out = tmp_path / "out"
-        # Model omits the BLANK page 2 but stamps physical markers 1 and 3, and
-        # stops cleanly (STOP). max(recovered={1,3})==3==actual -> NOT truncated.
+        # Model omits the BLANK page 2 but stamps physical markers 1 and 3, stops
+        # cleanly (STOP), AND emits the terminal sentinel. max(recovered={1,3})==3
+        # ==actual -> not tail-truncated; sentinel present -> completeness OK; so
+        # NO needless per-page fallback for a legitimately blank interior page.
         native_processor.client.models.generate_content.return_value = _mock_page_response(
-            "## Page 1\n\nP1 text\n\n## Page 3\n\nP3 text", finish_reason="STOP"
+            "## Page 1\n\nP1 text\n\n## Page 3\n\nP3 text\n\n<!-- OCR-END -->",
+            finish_reason="STOP",
         )
 
         outcome = native_processor.process(pdf, output_path=out)

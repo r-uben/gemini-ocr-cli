@@ -124,11 +124,12 @@ class TestOCRProcessorNative:
 
     def test_native_is_default_single_call(self, processor, sample_pdf):
         # Default mode is "auto": whole-PDF = ONE Gemini call. A complete response
-        # (one marker per actual page) must NOT trigger fallback => exactly 1 call.
+        # (one marker per actual page + terminal sentinel) must NOT trigger
+        # fallback => exactly 1 call.
         from tests.conftest import make_gemini_response
 
         processor.client.models.generate_content.return_value = make_gemini_response(
-            "## Page 1\n\nFirst page text.\n\n## Page 2\n\nSecond page text."
+            "## Page 1\n\nFirst page text.\n\n## Page 2\n\nSecond page text.\n\n<!-- OCR-END -->"
         )
         result = processor.process_pdf(sample_pdf, show_progress=False)
         assert result.success
@@ -143,7 +144,7 @@ class TestOCRProcessorNative:
         from tests.conftest import make_gemini_response
 
         processor.client.models.generate_content.return_value = make_gemini_response(
-            "## Page 1\n\nAlpha content.\n\n## Page 2\n\nBeta content."
+            "## Page 1\n\nAlpha content.\n\n## Page 2\n\nBeta content.\n\n<!-- OCR-END -->"
         )
         result = processor.process_pdf(sample_pdf, show_progress=False)
         assert result.success
@@ -152,6 +153,8 @@ class TestOCRProcessorNative:
         assert "Beta content." in result.pages[1]
         # Marker lines are dropped (contract re-adds canonical headers).
         assert "## Page" not in result.pages[0]
+        # The completeness sentinel must NOT leak into any saved page body.
+        assert "OCR-END" not in result.pages[1]
 
     def test_whole_pdf_no_markers_falls_back_to_single_page(self, processor, sample_pdf):
         # In forced whole_pdf mode (no fallback), an unsplittable blob is kept as
@@ -292,11 +295,12 @@ class TestOCRProcessorAutoFallback:
         assert processor.client.models.generate_content.call_count == 3
 
     def test_no_fallback_when_complete(self, processor, sample_pdf):
-        # A complete whole-PDF response (all pages, STOP) -> no fallback, 1 call.
+        # A complete whole-PDF response (all pages, STOP, terminal sentinel) ->
+        # no fallback, 1 call.
         from tests.conftest import make_gemini_response
 
         processor.client.models.generate_content.return_value = make_gemini_response(
-            "## Page 1\n\nA\n\n## Page 2\n\nB"
+            "## Page 1\n\nA\n\n## Page 2\n\nB\n\n<!-- OCR-END -->"
         )
         result = processor.process_pdf(sample_pdf, show_progress=False)  # auto
         assert result.mode == "whole_pdf"
@@ -314,6 +318,87 @@ class TestOCRProcessorAutoFallback:
         assert result.mode == "whole_pdf"
         assert result.fell_back_from_whole_pdf is False
         assert processor.client.models.generate_content.call_count == 1
+
+    def test_fallback_on_missing_sentinel_stop_finish(self, processor, sample_pdf):
+        # HIGH fix: a STOP-finish response that reaches the last page marker but
+        # was cut mid-body (no terminal ``<!-- OCR-END -->`` sentinel) must be
+        # treated as truncated -> auto-fallback. Without the sentinel oracle this
+        # is the silent data-loss mode codex rated HIGH: max(recovered)==actual so
+        # the page signal stays quiet and the cut tail is cached as completed.
+        from tests.conftest import make_gemini_response
+
+        first = {"done": False}
+
+        def gen(*args, **kwargs):
+            if not first["done"]:
+                first["done"] = True
+                # Markers for BOTH pages (max recovered == actual_pages) and a
+                # STOP finish, but NO terminal sentinel: the body of page 2 was
+                # cut off. is_truncated alone returns False here.
+                resp = make_gemini_response(
+                    "## Page 1\n\nFull first page.\n\n## Page 2\n\nSecond page cut mid-sen"
+                )
+                resp.candidates[0].finish_reason = "STOP"
+                return resp
+            return make_gemini_response("per-page text")
+
+        processor.client.models.generate_content.side_effect = gen
+        result = processor.process_pdf(sample_pdf, show_progress=False)  # auto
+        assert result.success
+        assert result.mode == "per_page"
+        assert result.fell_back_from_whole_pdf is True
+        # 1 whole-PDF call + 2 per-page calls = 3.
+        assert processor.client.models.generate_content.call_count == 3
+
+    def test_fallback_on_markerless_multipage(self, processor, sample_pdf):
+        # HIGH fix: a multi-page PDF (actual_pages > 1) whose native response
+        # carries ZERO ``## Page N`` markers collapses to a single blob. The
+        # recovered set is empty so the contract's page signal is disabled and
+        # is_truncated returns False -> previously cached as ONE page (markerless
+        # collapse). It must now be treated as truncation -> auto-fallback.
+        from tests.conftest import make_gemini_response
+
+        first = {"done": False}
+
+        def gen(*args, **kwargs):
+            if not first["done"]:
+                first["done"] = True
+                # No page markers at all, STOP finish, even WITH a sentinel: the
+                # markerless-multipage signal alone must still force fallback.
+                resp = make_gemini_response(
+                    "One undivided blob for a 2-page PDF.\n\n<!-- OCR-END -->"
+                )
+                resp.candidates[0].finish_reason = "STOP"
+                return resp
+            return make_gemini_response("per-page text")
+
+        processor.client.models.generate_content.side_effect = gen
+        result = processor.process_pdf(sample_pdf, show_progress=False)  # auto
+        assert result.success
+        assert result.mode == "per_page"
+        assert result.fell_back_from_whole_pdf is True
+        assert result.page_count == 2  # per-page recovered both pages
+        assert processor.client.models.generate_content.call_count == 3
+
+    def test_complete_with_sentinel_no_fallback_and_stripped(self, processor, tmp_path, sample_pdf):
+        # HIGH fix (happy path): a complete response (one marker per page + a
+        # terminal sentinel, STOP) must NOT fall back, AND the sentinel must be
+        # stripped from the saved markdown body (it never leaks to disk).
+        from tests.conftest import make_gemini_response
+
+        processor.client.models.generate_content.return_value = make_gemini_response(
+            "## Page 1\n\nFirst.\n\n## Page 2\n\nSecond.\n\n<!-- OCR-END -->"
+        )
+        result = processor.process_pdf(sample_pdf, show_progress=False)  # auto
+        assert result.success
+        assert result.mode == "whole_pdf"
+        assert result.fell_back_from_whole_pdf is False
+        assert processor.client.models.generate_content.call_count == 1
+        # Sentinel stripped from the in-memory page bodies...
+        assert all("OCR-END" not in p for p in result.pages)
+        # ...and from the persisted markdown on disk.
+        md_path = processor.save_results(result, tmp_path, "sample.pdf")
+        assert "OCR-END" not in md_path.read_text(encoding="utf-8")
 
 
 # NOTE: The truncation-signal logic (``is_truncated``) and the native-response
