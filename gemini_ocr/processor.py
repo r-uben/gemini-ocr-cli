@@ -212,6 +212,10 @@ def _strip_end_sentinel(text: str) -> str:
     return _OCR_END_SENTINEL_RE.sub("", text or "")
 
 
+#: Thinking level sent to Gemini 3.x Flash models (see ``_build_generation_config``).
+_THINKING_LEVEL = "LOW"
+
+
 @dataclass
 class OCRResult:
     """Result from processing a document (one or more pages).
@@ -305,7 +309,9 @@ class OCRProcessor:
         return "429" in error_str or "rate limit" in error_str or "quota" in error_str
 
     # Gemini 3.x Flash models use thinking architecture and need explicit config
-    # to avoid empty responses (thinking stalls at low temperature).
+    # to avoid empty responses (thinking stalls at low temperature). LOW is the lowest
+    # level every 3.x Flash accepts: gemini-3.8-flash rejects MINIMAL with HTTP 400
+    # ("Thinking level MINIMAL is not supported for this model"), checked 2026-10-07.
     # Does NOT match: gemini-2.x (different thinking API), gemini-3-pro (not Flash)
     _GEMINI_3_FLASH_RE = re.compile(r"gemini-3(?:\.\d+)?-flash")
 
@@ -315,7 +321,7 @@ class OCRProcessor:
 
         if self._GEMINI_3_FLASH_RE.search(self.model_name):
             kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_level="MINIMAL",
+                thinking_level=_THINKING_LEVEL,
             )
 
         return types.GenerateContentConfig(**kwargs)

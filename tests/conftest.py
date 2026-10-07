@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 # Mark all tests as unit by default
@@ -47,9 +47,11 @@ def fixtures_dir() -> Path:
 
 @pytest.fixture
 def sample_image(tmp_path: Path) -> Path:
-    """Create a sample test image."""
+    """Create a sample test image with a line of text (a blank image gives Gemini nothing
+    to read, and gemini-3.8-flash answers it with an empty response)."""
     img_path = tmp_path / "sample.png"
-    img = Image.new("RGB", (100, 100), color="white")
+    img = Image.new("RGB", (400, 100), color="white")
+    ImageDraw.Draw(img).text((10, 40), "Scope 1 emissions 1.61", fill="black")
     img.save(img_path)
     return img_path
 

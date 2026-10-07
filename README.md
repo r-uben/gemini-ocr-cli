@@ -62,7 +62,7 @@ Usage: gemini-ocr [OPTIONS] INPUT_PATH
 Options:
   -o, --output-dir PATH           Output directory (default: <input_parent>/ocr/)
   --api-key TEXT                  Gemini API key (or set GEMINI_API_KEY env var)
-  --model TEXT                    Model to use (default: gemini-3-flash-preview)
+  --model TEXT                    Model to use (default: gemini-3.8-flash)
   --task [convert|extract|table|describe_figure]
                                   OCR task type (default: convert)
   --prompt TEXT                   Custom prompt for OCR processing
@@ -164,7 +164,7 @@ All CLI options can also be set via environment variables or a `.env` file:
 | CLI flag | Environment variable | Default |
 |----------|---------------------|---------|
 | `--api-key` | `GEMINI_API_KEY` | (required) |
-| `--model` | `GEMINI_MODEL` | `gemini-3-flash-preview` |
+| `--model` | `GEMINI_MODEL` | `gemini-3.8-flash` |
 | `--per-page` / `--whole-pdf` | `GEMINI_PDF_MODE` (`auto`\|`per_page`\|`whole_pdf`) | `auto` |
 | `--include-images` | `GEMINI_INCLUDE_IMAGES` | `true` |
 | `--workers` | `GEMINI_MAX_WORKERS` | `1` |

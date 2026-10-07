@@ -53,7 +53,7 @@ def _resolve_path(path: Path) -> Path:
     "--model",
     type=str,
     default=None,
-    help="Gemini model to use (default: gemini-3-flash-preview / $GEMINI_MODEL)",
+    help="Gemini model to use (default: gemini-3.8-flash / $GEMINI_MODEL)",
 )
 @click.option(
     "--task",
