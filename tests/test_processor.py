@@ -576,3 +576,13 @@ class TestOCRProcessorErrorHandling:
         assert result.success is False
         assert result.status.value == "failed"
         assert "exceeds maximum" in (result.error or "")
+
+
+@pytest.mark.parametrize("model", ["gemini-3-flash-preview", "gemini-3.8-flash"])
+def test_gemini_3_flash_thinking_level_is_low(mock_config, model):
+    """gemini-3.8-flash rejects MINIMAL with HTTP 400; LOW is accepted by every 3.x Flash."""
+    mock_config.model = model
+    with patch("gemini_ocr.processor.genai"):
+        processor = OCRProcessor(mock_config)
+    thinking = processor._build_generation_config().thinking_config
+    assert str(thinking.thinking_level).upper().endswith("LOW")
