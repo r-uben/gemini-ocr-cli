@@ -7,14 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-11
+
 ### Changed
 
+- Default model is `gemini-3.8-flash`.
+- `ocr-output-contract` is now required from PyPI (`>=0.1.3`) instead of a git
+  reference, so this package can be published to PyPI.
 - Bumped the shared `ocr-output-contract` pin to `v0.1.3` and re-locked `uv.lock`
   so a frozen install/CI exercises the same contract the engine is reviewed
   against.
 
 ### Fixed
 
+- `gemini-3.8-flash` rejects thinking level `MINIMAL`; requests now send `LOW`.
 - **AUTO completeness oracle** (round-3 HIGH): the default `auto` path no longer
   silently caches an incomplete native OCR as `completed`. Two data-loss modes
   that escaped the tail-aware `is_truncated` now force the per-page fallback:
