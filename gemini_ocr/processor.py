@@ -82,6 +82,16 @@ BACKEND = "gemini-api"
 # Shared console instance — CLI sets .quiet on this directly
 console = Console()
 
+#: Appended to every task prompt. Gemini 4 Hydrogen estimated bar heights on an
+#: unlabeled bar chart and wrote them as table cells (socr#1343); a citation corpus
+#: must hold printed numbers only.
+_PRINTED_NUMBERS_RULE = (
+    "\n\nNumbers rule: transcribe only numbers that are printed on the page. "
+    "Never estimate or read values off bars, lines, points or other chart marks. "
+    "Never compute, total or fill in values. For a chart, transcribe its title, "
+    "axis ticks, labels, legend and annotations exactly as printed."
+)
+
 # OCR prompts for the per-page / single-image path. The contract package supplies
 # the ``## Page N`` headers when assembling per-page results, so these prompts ask
 # only for the page body.
@@ -104,6 +114,7 @@ Provide a structured description.""",
     "table": """Extract all tables from this document and convert them to markdown format.
 Preserve all data, headers, and structure. Output only the markdown tables.""",
 }
+OCR_PROMPTS = {task: prompt + _PRINTED_NUMBERS_RULE for task, prompt in OCR_PROMPTS.items()}
 
 #: End-of-document sentinel the model is asked to emit as the FINAL line of a
 #: native whole-PDF response, AFTER the last page's body. It is the completeness
