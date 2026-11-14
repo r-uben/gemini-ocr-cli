@@ -586,3 +586,14 @@ def test_gemini_3_flash_thinking_level_is_low(mock_config, model):
         processor = OCRProcessor(mock_config)
     thinking = processor._build_generation_config().thinking_config
     assert str(thinking.thinking_level).upper().endswith("LOW")
+
+
+def test_printed_numbers_rule_in_every_prompt():
+    """socr#1343: every prompt, per-page and native, carries the printed-numbers rule."""
+    from gemini_ocr.processor import _PRINTED_NUMBERS_RULE, OCR_PROMPTS, OCR_PROMPTS_NATIVE
+
+    assert "only numbers that are printed" in _PRINTED_NUMBERS_RULE
+    assert OCR_PROMPTS and set(OCR_PROMPTS) == set(OCR_PROMPTS_NATIVE)
+    for task, prompt in OCR_PROMPTS.items():
+        assert _PRINTED_NUMBERS_RULE in prompt, task
+        assert _PRINTED_NUMBERS_RULE in OCR_PROMPTS_NATIVE[task], task
